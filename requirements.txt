@@ -11,3 +11,4 @@ Pillow
 django-cors-headers
 python-decouple
 dj-database-url
+gunicorn
