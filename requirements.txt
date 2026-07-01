@@ -1,0 +1,13 @@
+django
+djangorestframework
+djangorestframework-simplejwt
+django-environ
+psycopg2-binary
+cloudinary
+django-cloudinary-storage
+requests
+httpx
+Pillow
+django-cors-headers
+python-decouple
+dj-database-url
