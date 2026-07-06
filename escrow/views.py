@@ -111,6 +111,8 @@ class AgreementViewSet(viewsets.ModelViewSet):
         """
         Transitions the agreement status to AWAITING_PAYMENT and returns
         bank transfer instructions for the buyer to fund their virtual account.
+        If the buyer already has enough balance in their wallet, attempts to debit
+        them immediately and transition directly to ACTIVE.
         """
         agreement = get_object_or_404(self.get_queryset(), pk=pk)
 
@@ -142,7 +144,39 @@ class AgreementViewSet(viewsets.ModelViewSet):
         # Generate a unique transaction reference for tracking
         ref = f"tf-{agreement.pk}-{int(timezone.now().timestamp())}"
 
-        # Transition status to AWAITING_PAYMENT
+        # 1. Try to fund directly if buyer has sufficient wallet balance
+        try:
+            balance_data = NombaPaymentService().get_account_balance(buyer.nomba_account_holder_id)
+            available_balance = float(balance_data.get("amount", 0.0))
+        except Exception as exc:
+            logger.warning("Could not check wallet balance: %s", exc)
+            available_balance = 0.0
+
+        if available_balance >= float(agreement.amount):
+            try:
+                NombaPaymentService().hold_funds(
+                    amount=float(agreement.amount),
+                    account_number=buyer.nomba_account_number,
+                    bank_code=buyer.nomba_bank_code,
+                    ref=ref
+                )
+                # Successful direct funding!
+                agreement.status = EscrowAgreement.Status.ACTIVE
+                agreement.nomba_transaction_ref = ref
+                agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
+
+                return Response({
+                    "detail": "Agreement successfully funded from your existing wallet balance.",
+                    "status": "ACTIVE",
+                    "agreement": EscrowAgreementSerializer(agreement, context={'request': request}).data
+                }, status=status.HTTP_200_OK)
+            except NombaInsufficientFundsError:
+                # If balance is actually insufficient on Nomba side, fall back to bank transfer flow
+                pass
+            except Exception as exc:
+                logger.error("Auto-funding hold_funds failed: %s", exc)
+
+        # 2. Otherwise, fall back to normal bank transfer flow
         agreement.status = EscrowAgreement.Status.AWAITING_PAYMENT
         agreement.nomba_transaction_ref = ref
         agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
