@@ -201,6 +201,8 @@ class NombaPaymentService:
               - accountRef
               - accountHolderId
         """
+        import re
+
         # accountRef must be 16–64 chars; prefix guarantees uniqueness.
         # Pad with zeros if the user ID is a short string/integer.
         account_ref = f"tf-user-{user_id}"
@@ -208,14 +210,22 @@ class NombaPaymentService:
             account_ref = f"tf-user-{str(user_id).zfill(8)}"
         account_ref = account_ref[:64]
 
-        display_name = account_name.strip() or f"TrustFlow User {str(user_id)[:8]}"
-        # Ensure minimum 8 chars required by Nomba
-        if len(display_name) < 8:
-            display_name = display_name.ljust(8)
+        raw_display_name = account_name.strip() or f"TrustFlow User {str(user_id)[:8]}"
+        
+        # Sanitize accountName to only allow alphanumeric and space characters
+        sanitized_name = re.sub(r'[^a-zA-Z0-9\s]', '', raw_display_name)
+        # Normalize multiple spaces to a single space
+        sanitized_name = re.sub(r'\s+', ' ', sanitized_name).strip()
+
+        # Enforce minimum 8 chars required by Nomba
+        if len(sanitized_name) < 8:
+            sanitized_name = f"TrustFlow User {str(user_id)[:8]}".strip()
+            if len(sanitized_name) < 8:
+                sanitized_name = sanitized_name.ljust(8)
 
         payload = {
             "accountRef": account_ref,
-            "accountName": display_name,
+            "accountName": sanitized_name,
             "currency": "NGN",
         }
         response = self._post("/v1/accounts/virtual", payload)
