@@ -119,3 +119,42 @@ class WithdrawView(APIView):
                 {"detail": str(exc)},
                 status=status.HTTP_502_BAD_GATEWAY
             )
+
+
+class DebugWalletView(APIView):
+    """
+    POST /api/auth/debug-wallet/
+    Attempts to provision a Nomba virtual wallet for the logged-in user,
+    returning the exact success or error response from Nomba.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        from payments.services import NombaPaymentService
+        try:
+            svc = NombaPaymentService()
+            full_name = f"{user.first_name} {user.last_name}".strip() or user.email
+            wallet = svc.create_virtual_wallet(str(user.id), account_name=full_name)
+            
+            user.nomba_account_ref       = wallet.get('accountRef', '')
+            user.nomba_account_number    = wallet.get('bankAccountNumber', '')
+            user.nomba_bank_code         = wallet.get('bankCode', 'NMB')
+            user.nomba_account_holder_id = wallet.get('accountHolderId', '') or wallet.get('id', '')
+            user.save(update_fields=[
+                'nomba_account_ref', 'nomba_account_number',
+                'nomba_bank_code', 'nomba_account_holder_id',
+            ])
+            return Response({
+                "status": "success",
+                "message": "Wallet provisioned successfully",
+                "wallet": wallet
+            })
+        except Exception as exc:
+            import traceback
+            return Response({
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "traceback": traceback.format_exc()
+            }, status=status.HTTP_400_BAD_REQUEST)
