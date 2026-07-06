@@ -412,7 +412,7 @@ class NombaPaymentService:
 
         logger.info("Nomba webhook received: event=%s ref=%s", event_type, reference)
 
-        if event_type == "collection.credit":
+        if event_type in ("collection.credit", "virtual_account.funded", "payment_success"):
             self._on_collection_credit(payload.get("data", {}))
         elif event_type == "transfer.success":
             self._on_transfer_success(payload.get("data", {}))
@@ -518,7 +518,7 @@ class NombaPaymentService:
 
         account_number = data.get("bankAccountNumber") or data.get("accountNumber")
         account_ref = data.get("accountRef")
-        amount = data.get("amount")
+        amount = data.get("amount") or data.get("amountReceived")
         payment_ref = data.get("paymentRef") or data.get("reference") or data.get("merchantTxRef", "")
 
         logger.info(

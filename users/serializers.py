@@ -80,6 +80,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class UserProfileSerializer(serializers.ModelSerializer):
     wallet_balance = serializers.SerializerMethodField()
+    nomba_test_mode = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -87,12 +88,12 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'id', 'email', 'username', 'first_name', 'last_name',
             'phone_number', 'bvn_verified', 'trust_score',
             'nomba_account_ref', 'nomba_account_number', 'nomba_bank_code',
-            'wallet_balance', 'date_joined',
+            'wallet_balance', 'date_joined', 'nomba_test_mode',
         ]
         read_only_fields = [
             'id', 'email', 'bvn_verified', 'trust_score',
             'nomba_account_ref', 'nomba_account_number', 'nomba_bank_code',
-            'wallet_balance', 'date_joined',
+            'wallet_balance', 'date_joined', 'nomba_test_mode',
         ]
 
     def get_wallet_balance(self, obj) -> float:
@@ -104,6 +105,10 @@ class UserProfileSerializer(serializers.ModelSerializer):
             except Exception:
                 return 0.0
         return 0.0
+
+    def get_nomba_test_mode(self, obj) -> bool:
+        from django.conf import settings
+        return getattr(settings, "NOMBA_TEST_MODE", True)
 
 
 class UserSearchSerializer(serializers.ModelSerializer):
