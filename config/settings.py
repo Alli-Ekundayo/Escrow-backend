@@ -122,8 +122,14 @@ SIMPLE_JWT = {
 # ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
-CORS_ALLOW_ALL_ORIGINS = DEBUG  # tighten in production
+CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', default=DEBUG, cast=bool)
 CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='', cast=Csv())
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.railway\.app$",
+    r"^https://.*\.up\.railway\.app$",
+    r"^https://.*\.vercel\.app$",
+]
+
 
 # ---------------------------------------------------------------------------
 # Cloudinary
