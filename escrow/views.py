@@ -130,16 +130,30 @@ class AgreementViewSet(viewsets.ModelViewSet):
 
         buyer = request.user
         if not buyer.has_nomba_account:
-            return Response(
-                {
-                    "detail": (
-                        "Buyer does not have a linked Nomba virtual wallet. "
-                        "Wallet provisioning may have failed at registration — "
-                        "please contact support to backfill your wallet."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            # Attempt on-demand wallet provisioning
+            try:
+                svc = NombaPaymentService()
+                full_name = f"{buyer.first_name} {buyer.last_name}".strip() or buyer.email
+                wallet = svc.create_virtual_wallet(str(buyer.id), account_name=full_name)
+                buyer.nomba_account_ref       = wallet.get('accountRef', '')
+                buyer.nomba_account_number    = wallet.get('bankAccountNumber', '')
+                buyer.nomba_bank_code         = wallet.get('bankCode', 'NMB')
+                buyer.nomba_account_holder_id = wallet.get('accountHolderId', '') or wallet.get('id', '')
+                buyer.save(update_fields=[
+                    'nomba_account_ref', 'nomba_account_number',
+                    'nomba_bank_code', 'nomba_account_holder_id',
+                ])
+            except Exception as exc:
+                logger.error("On-demand wallet provisioning failed for user %s during lock_funds: %s", buyer.id, exc)
+                return Response(
+                    {
+                        "detail": (
+                            f"Virtual wallet provisioning failed: {str(exc)}. "
+                            "Please contact support to backfill your wallet or retry later."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Generate a unique transaction reference for tracking
         ref = f"tf-{agreement.pk}-{int(timezone.now().timestamp())}"
@@ -156,8 +170,8 @@ class AgreementViewSet(viewsets.ModelViewSet):
             try:
                 NombaPaymentService().hold_funds(
                     amount=float(agreement.amount),
-                    account_number=buyer.nomba_account_number,
-                    bank_code=buyer.nomba_bank_code,
+                    buyer_account_number=buyer.nomba_account_number,
+                    buyer_bank_code=buyer.nomba_bank_code,
                     ref=ref
                 )
                 # Successful direct funding!
