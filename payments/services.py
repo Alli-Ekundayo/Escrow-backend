@@ -316,7 +316,9 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        source = source_account_id or self.sub_account_id
+        # Outbound payouts must be sent from the merchant's sub-account ID.
+        # Customer virtual account holder IDs are not valid source accounts.
+        source = self.sub_account_id
         bank_code = seller_bank_code
         if bank_code == "NMB":
             bank_code = "101"
@@ -369,7 +371,9 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        source = source_account_id or self.sub_account_id
+        # Outbound refunds must be sent from the merchant's sub-account ID.
+        # Customer virtual account holder IDs are not valid source accounts.
+        source = self.sub_account_id
         bank_code = buyer_bank_code
         if bank_code == "NMB":
             bank_code = "101"
