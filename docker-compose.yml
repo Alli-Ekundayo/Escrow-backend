@@ -13,26 +13,6 @@ services:
       - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U escrow_admin -d escrow_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  web:
-    build: .
-    container_name: escrow_web
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      # Override DATABASE_URL to point at the 'db' container (not localhost)
-      DATABASE_URL: postgres://escrow_admin:escrow_secure_password@db:5432/escrow_db
-    ports:
-      - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
 
 volumes:
   postgres_data:

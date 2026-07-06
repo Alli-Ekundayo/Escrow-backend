@@ -86,14 +86,22 @@ def update_trust_scores_task(user_id: int) -> None:
         logger.error("update_trust_scores_task: user %s not found", user_id)
         return
 
+    from django.db.models import Q
+
+    non_draft_statuses = [
+        EscrowAgreement.Status.ACTIVE,
+        EscrowAgreement.Status.PENDING_PROOF,
+        EscrowAgreement.Status.COMPLETED,
+        EscrowAgreement.Status.DISPUTED,
+        EscrowAgreement.Status.REFUNDED,
+    ]
+
     total = EscrowAgreement.objects.filter(
-        buyer=user
-    ).count() + EscrowAgreement.objects.filter(seller=user).count()
+        (Q(buyer=user) | Q(seller=user)) & Q(status__in=non_draft_statuses)
+    ).count()
 
     completed = EscrowAgreement.objects.filter(
-        buyer=user, status=EscrowAgreement.Status.COMPLETED
-    ).count() + EscrowAgreement.objects.filter(
-        seller=user, status=EscrowAgreement.Status.COMPLETED
+        (Q(buyer=user) | Q(seller=user)) & Q(status=EscrowAgreement.Status.COMPLETED)
     ).count()
 
     score = round((completed / total) * 100, 2) if total > 0 else 0.0

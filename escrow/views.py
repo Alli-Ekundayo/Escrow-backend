@@ -7,7 +7,12 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from ai_engine.services import QwenAIService
-from payments.services import NombaPaymentService
+from payments.services import (
+    NombaPaymentService,
+    NombaInsufficientFundsError,
+    NombaUnavailableError,
+    NombaAPIError,
+)
 from .models import EscrowAgreement, Milestone
 from .serializers import (
     EscrowAgreementSerializer,
@@ -101,15 +106,11 @@ class AgreementViewSet(viewsets.ModelViewSet):
         )
 
     # ------------------------------------------------------------------
-    # Action: lock_funds
-    # POST /api/escrow/{id}/lock-funds/
-    # ------------------------------------------------------------------
-
     @action(detail=True, methods=['post'], url_path='lock-funds')
     def lock_funds(self, request, pk=None):
         """
-        Calls Nomba to transfer buyer funds into the TrustFlow escrow account.
-        Agreement moves from Draft → Active.
+        Transitions the agreement status to AWAITING_PAYMENT and returns
+        bank transfer instructions for the buyer to fund their virtual account.
         """
         agreement = get_object_or_404(self.get_queryset(), pk=pk)
 
@@ -126,33 +127,39 @@ class AgreementViewSet(viewsets.ModelViewSet):
             )
 
         buyer = request.user
-        if not buyer.nomba_wallet_id:
+        if not buyer.has_nomba_account:
             return Response(
-                {"detail": "Buyer does not have a linked Nomba wallet."},
+                {
+                    "detail": (
+                        "Buyer does not have a linked Nomba virtual wallet. "
+                        "Wallet provisioning may have failed at registration — "
+                        "please contact support to backfill your wallet."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            ref = f"tf-{agreement.pk}-{int(timezone.now().timestamp())}"
-            NombaPaymentService().hold_funds(
-                amount=float(agreement.amount),
-                buyer_wallet_id=buyer.nomba_wallet_id,
-                ref=ref,
-            )
-        except Exception as exc:
-            logger.error("Nomba hold_funds failed for agreement %s: %s", pk, exc)
-            return Response(
-                {"detail": "Payment processing failed. Please try again."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
+        # Generate a unique transaction reference for tracking
+        ref = f"tf-{agreement.pk}-{int(timezone.now().timestamp())}"
 
-        agreement.status = EscrowAgreement.Status.ACTIVE
+        # Transition status to AWAITING_PAYMENT
+        agreement.status = EscrowAgreement.Status.AWAITING_PAYMENT
         agreement.nomba_transaction_ref = ref
         agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
 
-        return Response(
-            EscrowAgreementSerializer(agreement, context={'request': request}).data
-        )
+        # Return payment instructions so front-end can display it nicely
+        return Response({
+            "detail": "Escrow initialized. Please complete bank transfer to fund the escrow.",
+            "payment_instructions": {
+                "bank_name": "Nomba MFB",
+                "bank_code": buyer.nomba_bank_code or "NMB",
+                "account_number": buyer.nomba_account_number,
+                "amount": str(agreement.amount),
+                "currency": agreement.currency,
+                "payment_reference": ref,
+            },
+            "agreement": EscrowAgreementSerializer(agreement, context={'request': request}).data
+        }, status=status.HTTP_200_OK)
 
     # ------------------------------------------------------------------
     # Action: submit_proof
@@ -190,18 +197,24 @@ class AgreementViewSet(viewsets.ModelViewSet):
             Milestone, pk=data['milestone_id'], agreement=agreement
         )
 
-        # Handle file upload
-        proof_url = ""
+        # Save proof data
+        update_fields = []
         if data.get('proof_file'):
             from django.core.files.storage import default_storage
             file = data['proof_file']
             path = default_storage.save(f"proofs/{agreement.pk}/{file.name}", file)
-            proof_url = default_storage.url(path)
-            milestone.proof_url = proof_url
-            milestone.save(update_fields=['proof_url'])
+            milestone.proof_url = default_storage.url(path)
+            update_fields.append('proof_url')
+
+        if data.get('proof_description'):
+            milestone.proof_description = data['proof_description']
+            update_fields.append('proof_description')
+
+        if update_fields:
+            milestone.save(update_fields=update_fields)
 
         # Run AI verification (inline — no Celery)
-        proof_text = data.get('proof_description', '') or f"File uploaded: {proof_url}"
+        proof_text = milestone.proof_description or f"File uploaded: {milestone.proof_url}"
         verify_proof_task(milestone.pk, proof_text)
 
         # Refresh from DB after task update
@@ -245,19 +258,27 @@ class AgreementViewSet(viewsets.ModelViewSet):
             )
 
         seller = agreement.seller
-        if not seller.nomba_wallet_id:
+        if not seller.has_nomba_account:
             return Response(
-                {"detail": "Seller does not have a linked Nomba wallet."},
+                {"detail": "Seller does not have a linked Nomba virtual account."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             NombaPaymentService().release_to_seller(
                 amount=float(agreement.amount),
-                seller_wallet_id=seller.nomba_wallet_id,
+                seller_account_number=seller.nomba_account_number,
+                seller_bank_code=seller.nomba_bank_code,
                 ref=agreement.nomba_transaction_ref,
+                source_account_id=agreement.buyer.nomba_account_holder_id,
             )
-        except Exception as exc:
+        except NombaUnavailableError as exc:
+            logger.error("Nomba unavailable during release for agreement %s: %s", pk, exc)
+            return Response(
+                {"detail": "Payment gateway is temporarily unavailable. Please try again shortly."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except (NombaAPIError, Exception) as exc:
             logger.error("Nomba release_to_seller failed for agreement %s: %s", pk, exc)
             return Response(
                 {"detail": "Payout failed. Please try again."},

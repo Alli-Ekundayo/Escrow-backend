@@ -12,7 +12,17 @@ class User(AbstractUser):
     phone_number = models.CharField(max_length=20, unique=True)
     bvn_verified = models.BooleanField(default=False)
     trust_score = models.FloatField(default=0.0)
-    nomba_wallet_id = models.CharField(max_length=100, blank=True)
+
+    # Nomba virtual account (provisioned at registration)
+    # accountRef returned by POST /v1/accounts/virtual
+    nomba_account_ref = models.CharField(max_length=100, blank=True)
+    # 10-digit NUBAN assigned by Nomba (bankAccountNumber) — buyers share this for incoming transfers
+    nomba_account_number = models.CharField(max_length=20, blank=True)
+    # Bank code for this virtual account (always "NMB" or Nomba's code)
+    nomba_bank_code = models.CharField(max_length=10, blank=True)
+    # Nomba internal account UUID (accountHolderId) — used as the source ID in
+    # /v2/transfers/bank/{id} to send money OUT of the virtual account (e.g. on release/refund)
+    nomba_account_holder_id = models.CharField(max_length=100, blank=True)
 
     USERNAME_FIELD = 'email'
     # username + phone required at registration
@@ -25,3 +35,8 @@ class User(AbstractUser):
 
     def __str__(self):
         return f"{self.get_full_name() or self.email}"
+
+    @property
+    def has_nomba_account(self) -> bool:
+        """True when a Nomba virtual account has been successfully provisioned."""
+        return bool(self.nomba_account_number)

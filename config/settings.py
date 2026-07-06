@@ -152,6 +152,8 @@ NOMBA_TEST_CLIENT_SECRET = config('NOMBA_TEST_CLIENT_SECRET', default='')
 # Toggle: True → sandbox  |  False → production
 NOMBA_TEST_MODE = config('NOMBA_TEST_MODE', default=True, cast=bool)
 
+NOMBA_WEBHOOK_SECRET = config('NOMBA_WEBHOOK_SECRET', default='')
+
 # ---------------------------------------------------------------------------
 # Password Validators
 # ---------------------------------------------------------------------------

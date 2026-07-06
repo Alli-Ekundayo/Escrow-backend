@@ -9,12 +9,13 @@ class EscrowAgreement(models.Model):
     """
 
     class Status(models.TextChoices):
-        DRAFT = 'draft', 'Draft'
-        ACTIVE = 'active', 'Active'
-        PENDING_PROOF = 'pending_proof', 'Pending Proof'
-        COMPLETED = 'completed', 'Completed'
-        DISPUTED = 'disputed', 'Disputed'
-        REFUNDED = 'refunded', 'Refunded'
+        DRAFT           = 'draft',            'Draft'
+        AWAITING_PAYMENT = 'awaiting_payment', 'Awaiting Payment'
+        ACTIVE          = 'active',            'Active'
+        PENDING_PROOF   = 'pending_proof',     'Pending Proof'
+        COMPLETED       = 'completed',         'Completed'
+        DISPUTED        = 'disputed',          'Disputed'
+        REFUNDED        = 'refunded',          'Refunded'
 
     buyer = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -87,6 +88,7 @@ class Milestone(models.Model):
     description = models.TextField()
     is_met = models.BooleanField(default=False)
     proof_url = models.URLField(blank=True)
+    proof_description = models.TextField(blank=True)
     verified_at = models.DateTimeField(null=True, blank=True)
 
     # AI verification result

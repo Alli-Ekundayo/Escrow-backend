@@ -136,11 +136,23 @@ class DisputeViewSet(viewsets.ModelViewSet):
         # --- Fund Disbursement ---
         try:
             if verdict == 'buyer':
-                nomba.refund_to_buyer(amount, agreement.buyer.nomba_wallet_id, ref)
+                nomba.refund_to_buyer(
+                    amount=amount,
+                    buyer_account_number=agreement.buyer.nomba_account_number,
+                    buyer_bank_code=agreement.buyer.nomba_bank_code,
+                    ref=ref,
+                    source_account_id=agreement.buyer.nomba_account_holder_id,
+                )
                 agreement.status = EscrowAgreement.Status.REFUNDED
 
             elif verdict == 'seller':
-                nomba.release_to_seller(amount, agreement.seller.nomba_wallet_id, ref)
+                nomba.release_to_seller(
+                    amount=amount,
+                    seller_account_number=agreement.seller.nomba_account_number,
+                    seller_bank_code=agreement.seller.nomba_bank_code,
+                    ref=ref,
+                    source_account_id=agreement.buyer.nomba_account_holder_id,
+                )
                 agreement.status = EscrowAgreement.Status.COMPLETED
 
             else:  # split
@@ -154,15 +166,19 @@ class DisputeViewSet(viewsets.ModelViewSet):
 
                 if buyer_pct > 0:
                     nomba.refund_to_buyer(
-                        round(amount * buyer_pct, 2),
-                        agreement.buyer.nomba_wallet_id,
-                        f"{ref}-split-buyer",
+                        amount=round(amount * buyer_pct, 2),
+                        buyer_account_number=agreement.buyer.nomba_account_number,
+                        buyer_bank_code=agreement.buyer.nomba_bank_code,
+                        ref=f"{ref}-split-buyer",
+                        source_account_id=agreement.buyer.nomba_account_holder_id,
                     )
                 if seller_pct > 0:
                     nomba.release_to_seller(
-                        round(amount * seller_pct, 2),
-                        agreement.seller.nomba_wallet_id,
-                        f"{ref}-split-seller",
+                        amount=round(amount * seller_pct, 2),
+                        seller_account_number=agreement.seller.nomba_account_number,
+                        seller_bank_code=agreement.seller.nomba_bank_code,
+                        ref=f"{ref}-split-seller",
+                        source_account_id=agreement.buyer.nomba_account_holder_id,
                     )
                 agreement.status = EscrowAgreement.Status.COMPLETED
 

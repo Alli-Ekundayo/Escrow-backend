@@ -6,10 +6,10 @@ class MilestoneSerializer(serializers.ModelSerializer):
     class Meta:
         model = Milestone
         fields = [
-            'id', 'description', 'is_met', 'proof_url',
+            'id', 'description', 'is_met', 'proof_url', 'proof_description',
             'verified_at', 'ai_confidence', 'ai_reason',
         ]
-        read_only_fields = ['is_met', 'verified_at', 'ai_confidence', 'ai_reason']
+        read_only_fields = ['is_met', 'verified_at', 'ai_confidence', 'ai_reason', 'proof_description']
 
 
 class EscrowAgreementSerializer(serializers.ModelSerializer):

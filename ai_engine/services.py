@@ -7,6 +7,7 @@ parsed directly without regex cleanup.
 
 import json
 import logging
+import re
 
 import httpx
 from django.conf import settings
@@ -23,6 +24,13 @@ class QwenAIService:
 
     def __init__(self):
         self.api_key = settings.DASHSCOPE_API_KEY
+        if not self.api_key:
+            # Log a warning but don't hard-crash — the HTTP call will fail
+            # with a clear 401 that surfaces in logs.
+            logger.warning(
+                "DASHSCOPE_API_KEY is not set in settings. "
+                "AI calls will return 401 from DashScope."
+            )
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -132,19 +140,45 @@ No markdown, no explanation."""
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            logger.error("DashScope API error: %s — %s", exc.response.status_code, exc.response.text)
+            logger.error(
+                "DashScope HTTP error: status=%s body=%s",
+                exc.response.status_code,
+                exc.response.text,
+            )
+            raise
+        except httpx.TimeoutException as exc:
+            logger.error("DashScope request timed out: %s", exc)
             raise
         except httpx.RequestError as exc:
-            logger.error("DashScope request failed: %s", exc)
+            logger.error("DashScope connection error: %s", exc)
             raise
 
-        raw_content = response.json()["output"]["choices"][0]["message"]["content"]
+        # --- Parse the response body ---
+        body = response.json()
+        try:
+            raw_content = body["output"]["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            # Log the full response so the real cause (quota error, model error,
+            # unexpected schema change) is visible in server logs.
+            logger.error(
+                "DashScope response has unexpected shape: %s — full body: %s",
+                exc,
+                body,
+            )
+            raise ValueError(
+                f"DashScope returned an unexpected response structure: {body}"
+            ) from exc
 
-        # Strip accidental markdown fences if the model adds them
-        clean = raw_content.strip().strip("```json").strip("```").strip()
+        # Strip accidental markdown fences that some model versions add.
+        # NOTE: str.strip() strips *characters*, not substrings, so we must
+        # use re.sub to correctly remove ```json ... ``` wrappers.
+        clean = re.sub(r"^```(?:json)?\s*", "", raw_content.strip(), flags=re.IGNORECASE)
+        clean = re.sub(r"\s*```$", "", clean).strip()
 
         try:
             return json.loads(clean)
         except json.JSONDecodeError as exc:
-            logger.error("Qwen returned non-JSON content: %s", raw_content)
+            logger.error(
+                "Qwen returned non-JSON content (after fence strip): %r", raw_content
+            )
             raise ValueError(f"Qwen response was not valid JSON: {raw_content}") from exc

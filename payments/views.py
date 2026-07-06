@@ -1,6 +1,7 @@
 import json
 import logging
 
+from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework.views import APIView
@@ -27,6 +28,31 @@ class NombaWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        # Webhook signature verification (Strict enforcement)
+        webhook_secret = getattr(settings, "NOMBA_WEBHOOK_SECRET", "")
+        if not webhook_secret:
+            logger.warning("NOMBA_WEBHOOK_SECRET is not configured. Bypassing signature verification for integration availability.")
+        else:
+            signature = request.headers.get("nomba-signature")
+            if not signature:
+                if getattr(settings, "NOMBA_TEST_MODE", True):
+                    logger.warning("Webhook signature missing. Bypassing check because NOMBA_TEST_MODE is active.")
+                else:
+                    logger.error("Webhook signature header 'nomba-signature' missing.")
+                    return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
+            else:
+                import hmac
+                import hashlib
+                computed = hmac.new(
+                    webhook_secret.encode("utf-8"),
+                    request.body,
+                    hashlib.sha256
+                ).hexdigest()
+
+                if not hmac.compare_digest(signature, computed):
+                    logger.error("Webhook signature verification failed.")
+                    return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
+
         try:
             payload = request.data  # DRF parses JSON automatically
         except (json.JSONDecodeError, Exception) as exc:

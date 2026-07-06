@@ -1,7 +1,13 @@
-from rest_framework import generics, permissions
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from rest_framework import generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .serializers import RegisterSerializer, UserProfileSerializer, CustomTokenObtainPairSerializer
+from .serializers import RegisterSerializer, UserProfileSerializer, CustomTokenObtainPairSerializer, UserSearchSerializer
+
+User = get_user_model()
 
 
 class RegisterView(generics.CreateAPIView):
@@ -32,3 +38,84 @@ class ProfileView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
+
+
+class UserSearchView(APIView):
+    """
+    GET /api/auth/users/search/?q=<query>
+    Returns up to 10 users matching name or email (excludes self).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        q = request.query_params.get('q', '').strip()
+        qs = User.objects.exclude(pk=request.user.pk)
+        
+        if q:
+            qs = qs.filter(
+                Q(first_name__icontains=q) |
+                Q(last_name__icontains=q) |
+                Q(username__icontains=q) |
+                Q(email__icontains=q)
+            )
+            
+        qs = qs.order_by('first_name', 'last_name')[:10]
+        return Response(UserSearchSerializer(qs, many=True).data)
+
+
+class WithdrawView(APIView):
+    """
+    POST /api/auth/withdraw/
+    Initiates a payout from the user's virtual wallet to their external bank account.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        amount = request.data.get('amount')
+        account_number = request.data.get('account_number')
+        bank_code = request.data.get('bank_code')
+
+        if not all([amount, account_number, bank_code]):
+            return Response(
+                {"detail": "Fields amount, account_number, and bank_code are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            amount_val = float(amount)
+            if amount_val <= 0:
+                raise ValueError()
+        except ValueError:
+            return Response(
+                {"detail": "Amount must be a positive number."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not user.nomba_account_holder_id:
+            return Response(
+                {"detail": "No virtual wallet provisioned for this user."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            from payments.services import NombaPaymentService
+            import uuid
+            tx_ref = f"tf-wd-{user.id}-{uuid.uuid4().hex[:8]}"
+            
+            result = NombaPaymentService().release_to_seller(
+                amount=amount_val,
+                seller_account_number=account_number,
+                seller_bank_code=bank_code,
+                ref=tx_ref,
+                source_account_id=user.nomba_account_holder_id
+            )
+            return Response(
+                {"detail": "Withdrawal successful", "data": result},
+                status=status.HTTP_200_OK
+            )
+        except Exception as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
