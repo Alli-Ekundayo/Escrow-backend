@@ -100,10 +100,28 @@ class WithdrawView(APIView):
 
         try:
             from payments.services import NombaPaymentService
+            svc = NombaPaymentService()
+            
+            # Fetch and check current live available balance
+            balance_info = svc.get_account_balance(user.nomba_account_holder_id)
+            available_balance_kobo = balance_info.get("availableBalance", 0)
+            available_balance = float(available_balance_kobo) / 100.0
+            
+            if amount_val > available_balance:
+                return Response(
+                    {
+                        "detail": (
+                            f"Insufficient funds. Your available balance is ₦{available_balance:,.2f}, "
+                            f"but you tried to withdraw ₦{amount_val:,.2f}."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             import uuid
             tx_ref = f"tf-wd-{user.id}-{uuid.uuid4().hex[:8]}"
             
-            result = NombaPaymentService().release_to_seller(
+            result = svc.release_to_seller(
                 amount=amount_val,
                 seller_account_number=account_number,
                 seller_bank_code=bank_code,
@@ -115,6 +133,8 @@ class WithdrawView(APIView):
                 status=status.HTTP_200_OK
             )
         except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("Withdrawal error for user %s: %s", user.id, exc)
             return Response(
                 {"detail": str(exc)},
                 status=status.HTTP_502_BAD_GATEWAY
