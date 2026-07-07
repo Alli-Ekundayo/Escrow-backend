@@ -406,7 +406,7 @@ class NombaPaymentService:
             logger.warning("Nomba account lookup failed during payout (non-fatal): %s", exc)
 
         payload = {
-            "amount": int(round(float(amount) * 100)),
+            "amount": float(amount),
             "accountNumber": seller_account_number,
             "bankCode": bank_code,
             "accountName": account_name,
@@ -452,7 +452,7 @@ class NombaPaymentService:
             logger.warning("Nomba account lookup failed during withdrawal: %s", exc)
 
         payload = {
-            "amount": int(round(float(amount) * 100)),
+            "amount": float(amount),
             "accountNumber": account_number,
             "bankCode": bank_code,
             "accountName": resolved_name,
@@ -505,7 +505,7 @@ class NombaPaymentService:
             logger.warning("Nomba account lookup failed during refund (non-fatal): %s", exc)
 
         payload = {
-            "amount": int(round(float(amount) * 100)),
+            "amount": float(amount),
             "accountNumber": buyer_account_number,
             "bankCode": bank_code,
             "accountName": account_name,
