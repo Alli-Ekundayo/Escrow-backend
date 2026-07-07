@@ -345,10 +345,12 @@ class NombaPaymentService:
                 )
                 resp.raise_for_status()
                 banks = resp.json().get("data", [])
+                # Widen name match to catch all Nomba MFB variations
+                _nomba_keywords = ("nomba", "nombank", "nom mfb", "nom microfinance")
                 for bank in banks:
                     name = (bank.get("bankName") or bank.get("name") or "").lower()
-                    if "nomba" in name or "nombank" in name:
-                        code = bank.get("bankCode") or bank.get("code", "")
+                    if any(kw in name for kw in _nomba_keywords):
+                        code = str(bank.get("bankCode") or bank.get("code") or "")
                         # Nomba requires exactly 3 or 6 digit numeric codes
                         if code and len(code) in (3, 6) and code.isdigit():
                             logger.info("Resolved Nomba MFB bank code: %s (%s)", code, name)
@@ -387,9 +389,11 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Always pay out from the merchant sub-account — never from a customer
-        # virtual account holder ID.
-        source = self.sub_account_id
+        # Pay out from the parent merchant account.
+        # All virtual-account inflows (collection.credit) are credited to the
+        # parent account by Nomba — the sub-account is a separate ledger that
+        # is not automatically funded by incoming virtual-account transfers.
+        source = self.parent_account_id
 
         # Resolve the numeric bank code Nomba requires (3 or 6 digits).
         bank_code = self._resolve_bank_code(seller_bank_code)
@@ -398,14 +402,15 @@ class NombaPaymentService:
         try:
             lookup_payload = {
                 "accountNumber": seller_account_number,
-                "bankCode": bank_code
+                "bankCode": bank_code,
             }
             lookup_resp = self._post("/v1/transfers/bank/lookup", lookup_payload)
             resolved_name = lookup_resp.get("data", {}).get("accountName")
             if resolved_name:
                 account_name = resolved_name
         except Exception as exc:
-            logger.warning("Nomba account lookup failed during payout: %s", exc)
+            # 404 just means the account isn't on Nomba MFB — proceed with fallback name
+            logger.warning("Nomba account lookup failed during payout (non-fatal): %s", exc)
 
         payload = {
             "amount": int(round(float(amount) * 100)),
@@ -417,8 +422,8 @@ class NombaPaymentService:
             "senderName": "TrustFlow Escrow",
         }
         logger.info(
-            "Initiating payout: amount=%.2f NGN, to=%s (bank_code=%s), ref=%s-release",
-            amount, seller_account_number, bank_code, ref
+            "Initiating payout: amount=%.2f NGN, source=%s, to=%s (bank_code=%s), ref=%s-release",
+            amount, source, seller_account_number, bank_code, ref
         )
         response = self._post(f"/v2/transfers/bank/{source}", payload)
         return response.get("data", response)
@@ -462,7 +467,7 @@ class NombaPaymentService:
             "narration": f"TrustFlow wallet withdrawal — {ref}",
             "senderName": "TrustFlow Escrow",
         }
-        response = self._post(f"/v2/transfers/bank/{self.sub_account_id}", payload)
+        response = self._post(f"/v2/transfers/bank/{self.parent_account_id}", payload)
         return response.get("data", response)
 
     def refund_to_buyer(
@@ -487,8 +492,8 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Always refund from the merchant sub-account.
-        source = self.sub_account_id
+        # Refund from the parent merchant account (same reason as release_to_seller).
+        source = self.parent_account_id
 
         # Resolve the numeric bank code Nomba requires (3 or 6 digits).
         bank_code = self._resolve_bank_code(buyer_bank_code)
@@ -497,14 +502,14 @@ class NombaPaymentService:
         try:
             lookup_payload = {
                 "accountNumber": buyer_account_number,
-                "bankCode": bank_code
+                "bankCode": bank_code,
             }
             lookup_resp = self._post("/v1/transfers/bank/lookup", lookup_payload)
             resolved_name = lookup_resp.get("data", {}).get("accountName")
             if resolved_name:
                 account_name = resolved_name
         except Exception as exc:
-            logger.warning("Nomba account lookup failed during refund: %s", exc)
+            logger.warning("Nomba account lookup failed during refund (non-fatal): %s", exc)
 
         payload = {
             "amount": int(round(float(amount) * 100)),
