@@ -135,57 +135,96 @@ class DisputeViewSet(viewsets.ModelViewSet):
         ref = agreement.nomba_transaction_ref
 
         # --- Fund Disbursement ---
+        from django.db import transaction as db_transaction
+        from decimal import Decimal
         try:
-            if verdict == 'buyer':
-                nomba.refund_to_buyer(
-                    amount=amount,
-                    buyer_account_number=agreement.buyer.nomba_account_number,
-                    buyer_bank_code=agreement.buyer.nomba_bank_code,
-                    ref=ref,
-                    source_account_id=agreement.buyer.nomba_account_holder_id,
-                )
-                agreement.status = EscrowAgreement.Status.REFUNDED
+            with db_transaction.atomic():
+                # Refresh agreement inside transaction
+                agr = EscrowAgreement.objects.select_for_update().get(pk=agreement.pk)
 
-            elif verdict == 'seller':
-                nomba.release_to_seller(
-                    amount=amount,
-                    seller_account_number=agreement.seller.nomba_account_number,
-                    seller_bank_code=agreement.seller.nomba_bank_code,
-                    ref=ref,
-                    source_account_id=agreement.buyer.nomba_account_holder_id,
-                )
-                agreement.status = EscrowAgreement.Status.COMPLETED
-
-            else:  # split
-                ratio_str = ruling.get('split_ratio', '50%:50%')
-                try:
-                    buyer_pct, seller_pct = [
-                        float(p.strip('%')) / 100 for p in ratio_str.split(':')
-                    ]
-                except Exception:
-                    logger.warning(
-                        "Dispute %s: could not parse split_ratio %r — defaulting to 50/50.",
-                        pk, ratio_str
-                    )
-                    buyer_pct, seller_pct = 0.5, 0.5
-
-                if buyer_pct > 0:
+                if verdict == 'buyer':
                     nomba.refund_to_buyer(
-                        amount=round(amount * buyer_pct, 2),
-                        buyer_account_number=agreement.buyer.nomba_account_number,
-                        buyer_bank_code=agreement.buyer.nomba_bank_code,
-                        ref=f"{ref}-split-buyer",
-                        source_account_id=agreement.buyer.nomba_account_holder_id,
+                        amount=amount,
+                        buyer_account_number=agr.buyer.nomba_account_number,
+                        buyer_bank_code=agr.buyer.nomba_bank_code,
+                        ref=ref,
+                        source_account_id=agr.buyer.nomba_account_holder_id,
                     )
-                if seller_pct > 0:
+                    agr.status = EscrowAgreement.Status.REFUNDED
+                    
+                    # Credit buyer's wallet balance
+                    buyer = agr.buyer
+                    buyer_ref = type(buyer).objects.select_for_update().get(pk=buyer.pk)
+                    buyer_ref.wallet_balance += agr.amount
+                    buyer_ref.save(update_fields=['wallet_balance'])
+                    logger.info("resolve_dispute: Refunded agreement %s to buyer %s.", agr.id, buyer.email)
+
+                elif verdict == 'seller':
                     nomba.release_to_seller(
-                        amount=round(amount * seller_pct, 2),
-                        seller_account_number=agreement.seller.nomba_account_number,
-                        seller_bank_code=agreement.seller.nomba_bank_code,
-                        ref=f"{ref}-split-seller",
-                        source_account_id=agreement.buyer.nomba_account_holder_id,
+                        amount=amount,
+                        seller_account_number=agr.seller.nomba_account_number,
+                        seller_bank_code=agr.seller.nomba_bank_code,
+                        ref=ref,
+                        source_account_id=agr.buyer.nomba_account_holder_id,
                     )
-                agreement.status = EscrowAgreement.Status.COMPLETED
+                    agr.status = EscrowAgreement.Status.COMPLETED
+                    
+                    # Credit seller's wallet balance
+                    seller = agr.seller
+                    seller_ref = type(seller).objects.select_for_update().get(pk=seller.pk)
+                    seller_ref.wallet_balance += agr.amount
+                    seller_ref.save(update_fields=['wallet_balance'])
+                    logger.info("resolve_dispute: Released agreement %s to seller %s.", agr.id, seller.email)
+
+                else:  # split
+                    ratio_str = ruling.get('split_ratio', '50%:50%')
+                    try:
+                        buyer_pct, seller_pct = [
+                            float(p.strip('%')) / 100 for p in ratio_str.split(':')
+                        ]
+                    except Exception:
+                        logger.warning(
+                            "Dispute %s: could not parse split_ratio %r — defaulting to 50/50.",
+                            pk, ratio_str
+                        )
+                        buyer_pct, seller_pct = 0.5, 0.5
+
+                    if buyer_pct > 0:
+                        nomba.refund_to_buyer(
+                            amount=round(amount * buyer_pct, 2),
+                            buyer_account_number=agr.buyer.nomba_account_number,
+                            buyer_bank_code=agr.buyer.nomba_bank_code,
+                            ref=f"{ref}-split-buyer",
+                            source_account_id=agr.buyer.nomba_account_holder_id,
+                        )
+                    if seller_pct > 0:
+                        nomba.release_to_seller(
+                            amount=round(amount * seller_pct, 2),
+                            seller_account_number=agr.seller.nomba_account_number,
+                            seller_bank_code=agr.seller.nomba_bank_code,
+                            ref=f"{ref}-split-seller",
+                            source_account_id=agr.buyer.nomba_account_holder_id,
+                        )
+                    agr.status = EscrowAgreement.Status.COMPLETED
+
+                    # Credit split balances
+                    if buyer_pct > 0:
+                        buyer = agr.buyer
+                        buyer_ref = type(buyer).objects.select_for_update().get(pk=buyer.pk)
+                        buyer_ref.wallet_balance += Decimal(str(round(float(agr.amount) * buyer_pct, 2)))
+                        buyer_ref.save(update_fields=['wallet_balance'])
+                    if seller_pct > 0:
+                        seller = agr.seller
+                        seller_ref = type(seller).objects.select_for_update().get(pk=seller.pk)
+                        seller_ref.wallet_balance += Decimal(str(round(float(agr.amount) * seller_pct, 2)))
+                        seller_ref.save(update_fields=['wallet_balance'])
+                    logger.info(
+                        "resolve_dispute: Split agreement %s (buyer=%.2f, seller=%.2f).",
+                        agr.id, buyer_pct, seller_pct
+                    )
+
+                agr.ai_verdict = ruling.get('reasoning', '')
+                agr.save(update_fields=['status', 'ai_verdict', 'updated_at'])
 
         except Exception as exc:
             logger.error("Fund disbursement failed for dispute %s: %s", pk, exc)
@@ -193,9 +232,6 @@ class DisputeViewSet(viewsets.ModelViewSet):
                 {"detail": "AI ruling recorded but fund disbursement failed. Contact support."},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
-
-        agreement.ai_verdict = ruling.get('reasoning', '')
-        agreement.save(update_fields=['status', 'ai_verdict', 'updated_at'])
 
         dispute.status = Dispute.Status.RESOLVED
         dispute.resolved_at = timezone.now()

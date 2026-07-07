@@ -482,8 +482,21 @@ class AgreementViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        agreement.status = EscrowAgreement.Status.COMPLETED
-        agreement.save(update_fields=['status', 'updated_at'])
+        from django.db import transaction as db_transaction
+        with db_transaction.atomic():
+            agr = EscrowAgreement.objects.select_for_update().get(pk=agreement.pk)
+            if agr.status in (EscrowAgreement.Status.ACTIVE, EscrowAgreement.Status.PENDING_PROOF):
+                agr.status = EscrowAgreement.Status.COMPLETED
+                agr.save(update_fields=['status', 'updated_at'])
+                
+                # Credit seller's wallet balance
+                seller_refreshed = type(seller).objects.select_for_update().get(pk=seller.pk)
+                seller_refreshed.wallet_balance += agr.amount
+                seller_refreshed.save(update_fields=['wallet_balance'])
+                logger.info(
+                    "release_funds: Agreement %s completed. Credited seller %s with NGN %s.",
+                    agr.id, seller.email, agr.amount
+                )
 
         # Recalculate trust scores for both parties (inline)
         update_trust_scores_task(agreement.buyer_id)

@@ -707,6 +707,11 @@ class NombaPaymentService:
             account_number, account_ref, amount, merchant_tx_ref, payment_ref
         )
 
+        # Ignore internal transfer credits (e.g. from release/refund payout) to prevent double-crediting
+        if merchant_tx_ref and any(suffix in merchant_tx_ref for suffix in ["-release", "-refund", "-split-buyer", "-split-seller"]):
+            logger.info("Ignoring webhook collection credit because it is an internal escrow release/refund payout: %s", merchant_tx_ref)
+            return
+
         if not account_number and not account_ref and not merchant_tx_ref:
             logger.error("Missing account number, account ref, and merchantTxRef in webhook data.")
             return
