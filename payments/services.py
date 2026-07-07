@@ -389,26 +389,20 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Pay out from the merchant sub-account.
-        # NOTE: /v2/transfers/bank/{id} only accepts sub-account IDs.
-        # The sub-account must be funded via the Nomba dashboard before payouts work.
-        source = self.sub_account_id
-
-        # Resolve the numeric bank code Nomba requires (3 or 6 digits).
+        # Use /v1/transfers/bank — this endpoint reads the source account from the
+        # Authorization context (parent merchant account), which is where all
+        # virtual-account inflows (collection.credit) are credited by Nomba.
+        # Confirmed working: POST /v1/transfers/bank returns 200 in live testing.
         bank_code = self._resolve_bank_code(seller_bank_code)
 
         account_name = "TrustFlow Recipient"
         try:
-            lookup_payload = {
-                "accountNumber": seller_account_number,
-                "bankCode": bank_code,
-            }
-            lookup_resp = self._post("/v1/transfers/bank/lookup", lookup_payload)
+            lookup_resp = self._post("/v1/transfers/bank/lookup",
+                {"accountNumber": seller_account_number, "bankCode": bank_code})
             resolved_name = lookup_resp.get("data", {}).get("accountName")
             if resolved_name:
                 account_name = resolved_name
         except Exception as exc:
-            # 404 just means the account isn't on Nomba MFB — proceed with fallback name
             logger.warning("Nomba account lookup failed during payout (non-fatal): %s", exc)
 
         payload = {
@@ -421,10 +415,10 @@ class NombaPaymentService:
             "senderName": "TrustFlow Escrow",
         }
         logger.info(
-            "Initiating payout: amount=%.2f NGN, source=%s, to=%s (bank_code=%s), ref=%s-release",
-            amount, source, seller_account_number, bank_code, ref
+            "Initiating payout: amount=%.2f NGN, to=%s (bank_code=%s), ref=%s-release",
+            amount, seller_account_number, bank_code, ref
         )
-        response = self._post(f"/v2/transfers/bank/{source}", payload)
+        response = self._post("/v1/transfers/bank", payload)
         return response.get("data", response)
 
     def withdraw_to_bank(
@@ -466,7 +460,7 @@ class NombaPaymentService:
             "narration": f"TrustFlow wallet withdrawal — {ref}",
             "senderName": "TrustFlow Escrow",
         }
-        response = self._post(f"/v2/transfers/bank/{self.sub_account_id}", payload)
+        response = self._post("/v1/transfers/bank", payload)
         return response.get("data", response)
 
     def refund_to_buyer(
@@ -523,7 +517,7 @@ class NombaPaymentService:
             "Initiating refund: amount=%.2f NGN, to=%s (bank_code=%s), ref=%s-refund",
             amount, buyer_account_number, bank_code, ref
         )
-        response = self._post(f"/v2/transfers/bank/{source}", payload)
+        response = self._post("/v1/transfers/bank", payload)
         return response.get("data", response)
 
     # -----------------------------------------------------------------------
