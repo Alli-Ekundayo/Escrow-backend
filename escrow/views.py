@@ -280,6 +280,154 @@ class AgreementViewSet(viewsets.ModelViewSet):
         )
 
     # ------------------------------------------------------------------
+    # Action: verify_payment
+    # POST /api/escrow/{id}/verify-payment/
+    # ------------------------------------------------------------------
+
+    @action(detail=True, methods=['post'], url_path='verify-payment')
+    def verify_payment(self, request, pk=None):
+        """
+        Manually checks whether payment has been received for an AWAITING_PAYMENT
+        agreement and activates it if confirmed.
+
+        Use this when a buyer has transferred funds but the Nomba webhook either
+        failed to fire or failed to match the agreement (e.g. amount rounding, or
+        multiple pending agreements caused the webhook to credit the wallet instead).
+
+        Checks the buyer's wallet balance as a secondary fallback:
+          - If the buyer has enough wallet balance, deducts it and activates.
+
+        Returns the updated agreement on success.
+        """
+        agreement = get_object_or_404(self.get_queryset(), pk=pk)
+
+        if agreement.buyer != request.user:
+            return Response(
+                {"detail": "Only the buyer can verify payment."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if agreement.status == EscrowAgreement.Status.ACTIVE:
+            return Response(
+                {
+                    "detail": "Agreement is already active.",
+                    "agreement": EscrowAgreementSerializer(agreement, context={"request": request}).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if agreement.status != EscrowAgreement.Status.AWAITING_PAYMENT:
+            return Response(
+                {"detail": f"Cannot verify payment for an agreement in '{agreement.status}' status."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        buyer = request.user
+        from decimal import Decimal
+        from django.db import transaction as db_transaction
+
+        # ── Strategy A: buyer's wallet already has enough balance ───────────────
+        # This covers the case where the webhook received the payment but credited the
+        # wallet instead of the agreement (e.g. Strategy 4 fallback had no match).
+        with db_transaction.atomic():
+            buyer_refreshed = type(buyer).objects.select_for_update().get(pk=buyer.pk)
+            if buyer_refreshed.wallet_balance >= agreement.amount:
+                buyer_refreshed.wallet_balance -= agreement.amount
+                buyer_refreshed.save(update_fields=["wallet_balance"])
+                agreement.status = EscrowAgreement.Status.ACTIVE
+                agreement.save(update_fields=["status", "updated_at"])
+                logger.info(
+                    "verify_payment: Agreement %s activated from wallet balance for user %s. "
+                    "Deducted NGN %s, new balance: %s",
+                    agreement.id, buyer.email, agreement.amount, buyer_refreshed.wallet_balance
+                )
+                return Response(
+                    {
+                        "detail": "Payment verified. Agreement is now active (funded from your wallet).",
+                        "agreement": EscrowAgreementSerializer(agreement, context={"request": request}).data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+        # ── Strategy B: query Nomba transaction history ─────────────────────────
+        # Checks the last 24h of credits on the buyer's virtual account for a
+        # matching amount. Activates the agreement if one is found.
+        if not buyer.has_nomba_account:
+            return Response(
+                {
+                    "detail": (
+                        "No payment found in your wallet and your Nomba virtual account is "
+                        "not yet provisioned. Please complete the bank transfer first."
+                    )
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+
+        try:
+            svc = NombaPaymentService()
+            import datetime
+            from django.utils import timezone as tz
+
+            # Query recent transactions on the buyer's virtual account
+            since = (tz.now() - datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tx_resp = svc._get(
+                f"/v1/accounts/transactions",
+                params={
+                    "accountRef": buyer.nomba_account_ref,
+                    "startDate": since,
+                    "type": "CREDIT",
+                },
+            )
+            transactions = tx_resp.get("data", {}).get("records", tx_resp.get("data", []))
+
+            expected_kobo = int(round(float(agreement.amount) * 100))
+            matched_tx = None
+            for tx in (transactions if isinstance(transactions, list) else []):
+                tx_amount = tx.get("amount") or tx.get("amountReceived", 0)
+                # Allow ±1 kobo tolerance for floating point
+                if abs(int(tx_amount) - expected_kobo) <= 1:
+                    matched_tx = tx
+                    break
+
+            if matched_tx:
+                with db_transaction.atomic():
+                    agr = EscrowAgreement.objects.select_for_update().get(
+                        pk=agreement.pk, status=EscrowAgreement.Status.AWAITING_PAYMENT
+                    )
+                    agr.status = EscrowAgreement.Status.ACTIVE
+                    agr.save(update_fields=["status", "updated_at"])
+                logger.info(
+                    "verify_payment: Agreement %s activated via Nomba transaction history. "
+                    "tx_ref=%s, amount=%s kobo",
+                    agreement.id, matched_tx.get("reference"), matched_tx.get("amount")
+                )
+                agreement.refresh_from_db()
+                return Response(
+                    {
+                        "detail": "Payment confirmed. Agreement is now active.",
+                        "agreement": EscrowAgreementSerializer(agreement, context={"request": request}).data,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+        except Exception as exc:
+            logger.warning(
+                "verify_payment: Nomba transaction history lookup failed for agreement %s: %s",
+                agreement.id, exc
+            )
+            # Fall through to the final not-found response
+
+        return Response(
+            {
+                "detail": (
+                    "No matching payment found yet. If you've just transferred, please wait "
+                    "1–2 minutes for Nomba to process and try again."
+                )
+            },
+            status=status.HTTP_402_PAYMENT_REQUIRED,
+        )
+
+    # ------------------------------------------------------------------
     # Action: release_funds
     # POST /api/escrow/{id}/release-funds/
     # ------------------------------------------------------------------

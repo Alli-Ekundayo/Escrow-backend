@@ -581,6 +581,31 @@ class NombaPaymentService:
         except requests.HTTPError as exc:
             self._raise_for_nomba_error(exc, url=url)
 
+    def _get(self, path: str, params: dict = None) -> dict:
+        """Authenticated GET request to a Nomba API endpoint."""
+        url = f"{self.base_url}{path}"
+        try:
+            resp = requests.get(
+                url,
+                params=params or {},
+                headers=self._auth_headers(),
+                timeout=20,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.Timeout:
+            logger.error("Nomba API GET timeout: %s", url)
+            raise NombaUnavailableError(
+                f"Nomba GET request to {path} timed out."
+            )
+        except requests.ConnectionError as exc:
+            logger.error("Nomba connection error on GET: %s — %s", url, exc)
+            raise NombaUnavailableError(
+                f"Cannot connect to Nomba ({path}). Check network connectivity."
+            ) from exc
+        except requests.HTTPError as exc:
+            self._raise_for_nomba_error(exc, url=url)
+
     @staticmethod
     def _raise_for_nomba_error(exc: requests.HTTPError, url: str = "") -> None:
         """
@@ -651,8 +676,12 @@ class NombaPaymentService:
 
         Matching strategy (in priority order):
           1. merchantTxRef → nomba_transaction_ref (set during lock_funds — most reliable).
-          2. Buyer account number/ref + exact amount match (kobo→naira converted).
-          3. Single-agreement fallback (if buyer has only one pending agreement).
+             Only present for programmatic payments; absent for manual bank transfers.
+          2. Buyer account number/ref + EXACT amount match.
+          3. Single-agreement fallback (buyer has exactly 1 pending agreement).
+          4. Best-amount fallback for real bank transfers — picks the AWAITING_PAYMENT
+             agreement whose amount is closest to the received amount (within 10%).
+             This handles real bank-app transfers where Nomba sends no merchantTxRef.
 
         Uses select_for_update() inside an atomic block to prevent a race
         condition where two concurrent webhook retries activate the same agreement.
@@ -663,13 +692,14 @@ class NombaPaymentService:
         from decimal import Decimal
         User = get_user_model()
 
-        account_number = data.get("bankAccountNumber") or data.get("accountNumber")
-        account_ref    = data.get("accountRef")
-        amount         = data.get("amount") or data.get("amountReceived")
+        account_number  = data.get("bankAccountNumber") or data.get("accountNumber")
+        account_ref     = data.get("accountRef")
+        amount          = data.get("amount") or data.get("amountReceived")
         # merchantTxRef is the escrow reference set during lock_funds (tf-{pk}-{timestamp}).
-        # It is the canonical key for finding the agreement.
+        # It is the canonical key for finding the agreement — but it is ONLY present
+        # for programmatic (API-initiated) payments, NOT for manual bank transfers.
         merchant_tx_ref = data.get("merchantTxRef", "")
-        # paymentRef / reference is the payment provider's own transaction ID — we log it
+        # paymentRef / reference is the payment provider's own transaction ID — log it
         # but do NOT use it to overwrite the stored escrow reference.
         payment_ref = data.get("paymentRef") or data.get("reference") or merchant_tx_ref
 
@@ -694,56 +724,82 @@ class NombaPaymentService:
         # retries from activating the same agreement simultaneously.
         with transaction.atomic():
             matched_agreement = None
+            match_strategy   = None
 
             # ── Strategy 1: match by merchantTxRef ──────────────────────────────
-            # This is the most reliable path: the frontend sends the agreement's stored
-            # nomba_transaction_ref back as merchantTxRef when simulating / paying.
+            # Present only when the payment was initiated programmatically via Nomba API
+            # (e.g. from a simulator or wallet-funded flow). Missing for real bank transfers.
             if merchant_tx_ref:
                 matched_agreement = EscrowAgreement.objects.select_for_update().filter(
                     nomba_transaction_ref=merchant_tx_ref,
                     status=EscrowAgreement.Status.AWAITING_PAYMENT,
                 ).first()
                 if matched_agreement:
-                    logger.info(
-                        "Agreement %s matched by merchantTxRef=%s",
-                        matched_agreement.id, merchant_tx_ref
-                    )
+                    match_strategy = "merchantTxRef"
 
-            # ── Strategy 2: buyer account + amount ──────────────────────────────
+            # Resolve buyer from virtual account details (needed for strategies 2, 3, 4)
             buyer = None
             if account_number:
-                buyer = User.objects.select_for_update().filter(nomba_account_number=account_number).first()
+                buyer = User.objects.select_for_update().filter(
+                    nomba_account_number=account_number
+                ).first()
             if not buyer and account_ref:
-                buyer = User.objects.select_for_update().filter(nomba_account_ref=account_ref).first()
+                buyer = User.objects.select_for_update().filter(
+                    nomba_account_ref=account_ref
+                ).first()
 
             if not matched_agreement and buyer:
                 agreements_qs = EscrowAgreement.objects.select_for_update().filter(
                     buyer=buyer,
                     status=EscrowAgreement.Status.AWAITING_PAYMENT,
                 )
+
+                # ── Strategy 2: buyer account + exact amount ─────────────────
                 if target_amount:
                     matched_agreement = agreements_qs.filter(amount=target_amount).first()
+                    if matched_agreement:
+                        match_strategy = "exact_amount"
+
                 # ── Strategy 3: single-agreement fallback ────────────────────
                 if not matched_agreement and agreements_qs.count() == 1:
                     matched_agreement = agreements_qs.first()
-                    logger.info(
-                        "Single-agreement fallback for buyer %s (amount=%s)",
-                        buyer.email, target_amount
-                    )
+                    match_strategy = "single_agreement_fallback"
+
+                # ── Strategy 4: closest-amount fallback (real bank transfers) ─
+                # When a buyer manually transfers from their banking app, Nomba sends
+                # no merchantTxRef.  We pick the AWAITING_PAYMENT agreement whose
+                # amount is within 10% of the received amount (covers rounding and
+                # minor fee differences), breaking ties by most recently created.
+                if not matched_agreement and target_amount:
+                    best = None
+                    best_diff = None
+                    tolerance = target_amount * Decimal("0.10")  # 10% tolerance
+                    for ag in agreements_qs.order_by('-created_at'):
+                        diff = abs(ag.amount - target_amount)
+                        if diff <= tolerance:
+                            if best_diff is None or diff < best_diff:
+                                best = ag
+                                best_diff = diff
+                    if best:
+                        matched_agreement = best
+                        match_strategy = "closest_amount_fallback"
 
             if not matched_agreement:
+                # Nothing matched — credit the buyer's wallet as an unallocated top-up
                 if buyer and target_amount:
                     buyer.wallet_balance += target_amount
                     buyer.save(update_fields=['wallet_balance'])
                     logger.info(
-                        "Direct wallet funding: credited user %s with NGN %s. New balance: %s",
-                        buyer.email, target_amount, buyer.wallet_balance
+                        "Direct wallet funding: credited user %s with NGN %s. "
+                        "New balance: %s  (no matching AWAITING_PAYMENT agreement; "
+                        "payment_ref=%s)",
+                        buyer.email, target_amount, buyer.wallet_balance, payment_ref
                     )
                 else:
                     logger.warning(
-                        "No AWAITING_PAYMENT escrow agreement found and no buyer found to credit for "
-                        "merchantTxRef=%s, amount=%s",
-                        merchant_tx_ref, target_amount
+                        "No AWAITING_PAYMENT escrow agreement found and no buyer found to "
+                        "credit for merchantTxRef=%s, account=%s, amount=%s, payment_ref=%s",
+                        merchant_tx_ref, account_number, target_amount, payment_ref
                     )
                 return
 
@@ -755,9 +811,11 @@ class NombaPaymentService:
             matched_agreement.save(update_fields=['status', 'updated_at'])
 
         logger.info(
-            "EscrowAgreement %s marked ACTIVE via collection credit. "
-            "Stored ref=%s, incoming merchant_tx_ref=%s",
+            "EscrowAgreement %s marked ACTIVE via collection credit (strategy=%s). "
+            "Stored ref=%s, incoming merchant_tx_ref=%s, payment_ref=%s",
             matched_agreement.id,
+            match_strategy,
             matched_agreement.nomba_transaction_ref,
             merchant_tx_ref,
+            payment_ref,
         )
