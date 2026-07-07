@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import logging
 
@@ -28,21 +30,32 @@ class NombaWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        # Webhook signature verification (Strict enforcement)
+        # Webhook signature verification
         webhook_secret = getattr(settings, "NOMBA_WEBHOOK_SECRET", "")
+        is_test_mode = getattr(settings, "NOMBA_TEST_MODE", True)
+
         if not webhook_secret:
-            logger.warning("NOMBA_WEBHOOK_SECRET is not configured. Bypassing signature verification for integration availability.")
+            if not is_test_mode:
+                # Hard-reject in production — a missing secret must never silently
+                # allow unsigned requests to activate escrow agreements.
+                logger.critical(
+                    "NOMBA_WEBHOOK_SECRET is not configured. "
+                    "Rejecting all webhook requests in production mode."
+                )
+                return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
+            logger.warning(
+                "NOMBA_WEBHOOK_SECRET is not configured. "
+                "Bypassing signature verification (TEST_MODE only)."
+            )
         else:
             signature = request.headers.get("nomba-signature")
             if not signature:
-                if getattr(settings, "NOMBA_TEST_MODE", True):
+                if is_test_mode:
                     logger.warning("Webhook signature missing. Bypassing check because NOMBA_TEST_MODE is active.")
                 else:
                     logger.error("Webhook signature header 'nomba-signature' missing.")
                     return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
             else:
-                import hmac
-                import hashlib
                 computed = hmac.new(
                     webhook_secret.encode("utf-8"),
                     request.body,

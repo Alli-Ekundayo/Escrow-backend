@@ -1,3 +1,8 @@
+import logging
+import traceback
+import uuid
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework import generics, permissions, status
@@ -101,12 +106,11 @@ class WithdrawView(APIView):
         try:
             from payments.services import NombaPaymentService
             svc = NombaPaymentService()
-            
+
             # Fetch and check current live available balance
             balance_info = svc.get_account_balance(user.nomba_account_holder_id)
-            available_balance_kobo = balance_info.get("availableBalance", 0)
-            available_balance = float(available_balance_kobo) / 100.0
-            
+            available_balance = NombaPaymentService.parse_balance(balance_info)
+
             if amount_val > available_balance:
                 return Response(
                     {
@@ -118,22 +122,19 @@ class WithdrawView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            import uuid
             tx_ref = f"tf-wd-{user.id}-{uuid.uuid4().hex[:8]}"
-            
-            result = svc.release_to_seller(
+
+            result = svc.withdraw_to_bank(
                 amount=amount_val,
-                seller_account_number=account_number,
-                seller_bank_code=bank_code,
+                account_number=account_number,
+                bank_code=bank_code,
                 ref=tx_ref,
-                source_account_id=user.nomba_account_holder_id
             )
             return Response(
                 {"detail": "Withdrawal successful", "data": result},
                 status=status.HTTP_200_OK
             )
         except Exception as exc:
-            import logging
             logging.getLogger(__name__).error("Withdrawal error for user %s: %s", user.id, exc)
             return Response(
                 {"detail": str(exc)},
@@ -171,10 +172,9 @@ class DebugWalletView(APIView):
                 "wallet": wallet
             })
         except Exception as exc:
-            import traceback
             return Response({
                 "status": "failed",
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
-                "traceback": traceback.format_exc()
+                "traceback": traceback.format_exc() if settings.DEBUG else "Enable DEBUG mode for details.",
             }, status=status.HTTP_400_BAD_REQUEST)

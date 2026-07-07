@@ -1,5 +1,6 @@
 import logging
 
+from django.db.models import Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, permissions, status
@@ -30,8 +31,8 @@ class DisputeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         return Dispute.objects.filter(
-            agreement__buyer=user
-        ) | Dispute.objects.filter(agreement__seller=user)
+            Q(agreement__buyer=user) | Q(agreement__seller=user)
+        )
 
     def perform_create(self, serializer):
         agreement = serializer.validated_data['agreement']
@@ -162,6 +163,10 @@ class DisputeViewSet(viewsets.ModelViewSet):
                         float(p.strip('%')) / 100 for p in ratio_str.split(':')
                     ]
                 except Exception:
+                    logger.warning(
+                        "Dispute %s: could not parse split_ratio %r — defaulting to 50/50.",
+                        pk, ratio_str
+                    )
                     buyer_pct, seller_pct = 0.5, 0.5
 
                 if buyer_pct > 0:

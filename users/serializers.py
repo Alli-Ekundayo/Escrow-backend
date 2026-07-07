@@ -101,7 +101,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             try:
                 from payments.services import NombaPaymentService
                 balance_data = NombaPaymentService().get_account_balance(obj.nomba_account_holder_id)
-                return float(balance_data.get("balance", balance_data.get("availableBalance", balance_data.get("amount", 0.0))))
+                return NombaPaymentService.parse_balance(balance_data)
             except Exception:
                 return 0.0
         return 0.0

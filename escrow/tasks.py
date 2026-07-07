@@ -55,16 +55,34 @@ def verify_proof_task(milestone_id: int, proof_description: str) -> None:
 def check_agreement_deadlines_task() -> None:
     """
     Escalates all overdue active/pending_proof agreements to 'disputed'.
+    Creates a Dispute record for each one so the dispute resolution flow works.
+    Uses get_or_create so the task is safe to run more than once (idempotent).
     Intended to be called by a management command or cron job.
     """
     from .models import EscrowAgreement
+    from disputes.models import Dispute
 
     now = timezone.now()
     overdue = EscrowAgreement.objects.filter(
         deadline__lt=now,
         status__in=[EscrowAgreement.Status.ACTIVE, EscrowAgreement.Status.PENDING_PROOF],
-    )
-    count = overdue.update(status=EscrowAgreement.Status.DISPUTED)
+    ).select_related('buyer')
+
+    count = 0
+    for agreement in overdue:
+        # Create a Dispute row so the disputes resolve endpoint can function correctly.
+        # raised_by is set to the buyer (system escalation — no specific party).
+        Dispute.objects.get_or_create(
+            agreement=agreement,
+            defaults={
+                'raised_by': agreement.buyer,
+                'status': Dispute.Status.OPEN,
+            },
+        )
+        agreement.status = EscrowAgreement.Status.DISPUTED
+        agreement.save(update_fields=['status', 'updated_at'])
+        count += 1
+
     logger.info("check_agreement_deadlines_task: escalated %d agreement(s) to disputed", count)
 
 

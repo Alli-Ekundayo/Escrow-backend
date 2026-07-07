@@ -234,7 +234,8 @@ class NombaPaymentService:
 
     def get_account_balance(self, account_id: str) -> dict:
         """
-        Returns the balance for a given Nomba account ID.
+        Returns the raw balance dict for a given Nomba account ID.
+        Use parse_balance() to extract the NGN amount as a float.
         """
         url = f"{self.base_url}/v1/accounts/balance"
         try:
@@ -247,6 +248,21 @@ class NombaPaymentService:
             raise NombaUnavailableError("Nomba balance check timed out.")
         except requests.HTTPError as exc:
             self._raise_for_nomba_error(exc)
+
+    @staticmethod
+    def parse_balance(balance_data: dict) -> float:
+        """
+        Extracts the available balance (in NGN) from a Nomba balance response.
+        Nomba returns amounts in Kobo; this divides by 100.
+
+        Tries keys in priority order: availableBalance → balance → amount.
+        """
+        kobo = (
+            balance_data.get("availableBalance")
+            or balance_data.get("balance")
+            or balance_data.get("amount", 0)
+        )
+        return float(kobo) / 100
 
     # -----------------------------------------------------------------------
     # Fund lifecycle  (transfers via sub-account)
@@ -349,6 +365,48 @@ class NombaPaymentService:
         response = self._post(f"/v2/transfers/bank/{source}", payload)
         return response.get("data", response)
 
+    def withdraw_to_bank(
+        self,
+        amount: float,
+        account_number: str,
+        bank_code: str,
+        ref: str,
+    ) -> dict:
+        """
+        Sends funds from the TrustFlow sub-account to a user's external bank account.
+        Used for voluntary wallet withdrawals — distinct from escrow releases/refunds.
+
+        Args:
+            amount:         Amount in NGN.
+            account_number: Destination bank account number.
+            bank_code:      Destination bank code.
+            ref:            Unique withdrawal reference.
+
+        Returns:
+            Nomba transfer response data dict.
+        """
+        resolved_name = "TrustFlow Withdrawal"
+        try:
+            lookup_payload = {"accountNumber": account_number, "bankCode": bank_code}
+            lookup_resp = self._post("/v1/transfers/bank/lookup", lookup_payload)
+            name = lookup_resp.get("data", {}).get("accountName")
+            if name:
+                resolved_name = name
+        except Exception as exc:
+            logger.warning("Nomba account lookup failed during withdrawal: %s", exc)
+
+        payload = {
+            "amount": int(round(float(amount) * 100)),
+            "accountNumber": account_number,
+            "bankCode": bank_code,
+            "accountName": resolved_name,
+            "merchantTxRef": ref,
+            "narration": f"TrustFlow wallet withdrawal — {ref}",
+            "senderName": "TrustFlow Escrow",
+        }
+        response = self._post(f"/v2/transfers/bank/{self.sub_account_id}", payload)
+        return response.get("data", response)
+
     def refund_to_buyer(
         self,
         amount: float,
@@ -389,8 +447,7 @@ class NombaPaymentService:
             if resolved_name:
                 account_name = resolved_name
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Nomba account lookup failed: %s", exc)
+            logger.warning("Nomba account lookup failed during refund: %s", exc)
 
         payload = {
             "amount": int(round(float(amount) * 100)),
@@ -524,9 +581,13 @@ class NombaPaymentService:
         Hook: Handles incoming funds into a buyer's virtual account.
         Finds the user matching the account number or reference,
         finds their EscrowAgreement in AWAITING_PAYMENT, and transitions to ACTIVE.
+
+        Uses select_for_update() inside an atomic block to prevent a race
+        condition where two concurrent webhook retries activate the same agreement.
         """
         from escrow.models import EscrowAgreement
         from django.contrib.auth import get_user_model
+        from django.db import transaction
         from decimal import Decimal
         User = get_user_model()
 
@@ -562,33 +623,35 @@ class NombaPaymentService:
             logger.error("Invalid amount in webhook data: %s", amount)
             return
 
-        agreements = EscrowAgreement.objects.filter(
-            buyer=buyer,
-            status=EscrowAgreement.Status.AWAITING_PAYMENT
-        )
-
-        matched_agreement = None
-        if target_amount:
-            # Try to match the amount exactly
-            matched_agreement = agreements.filter(amount=target_amount).first()
-            if not matched_agreement:
-                # If only one awaiting payment, match it anyway (e.g. currency conv minor units etc)
-                if agreements.count() == 1:
-                    matched_agreement = agreements.first()
-        else:
-            matched_agreement = agreements.first()
-
-        if not matched_agreement:
-            logger.warning(
-                "No AWAITING_PAYMENT escrow agreement found for buyer %s with amount %s",
-                buyer.email, target_amount
+        # Use an atomic block + select_for_update to prevent two concurrent webhook
+        # retries from activating the same agreement simultaneously.
+        with transaction.atomic():
+            agreements_qs = EscrowAgreement.objects.select_for_update().filter(
+                buyer=buyer,
+                status=EscrowAgreement.Status.AWAITING_PAYMENT,
             )
-            return
 
-        # Transition the agreement to ACTIVE
-        matched_agreement.status = EscrowAgreement.Status.ACTIVE
-        matched_agreement.nomba_transaction_ref = payment_ref
-        matched_agreement.save()
+            matched_agreement = None
+            if target_amount:
+                matched_agreement = agreements_qs.filter(amount=target_amount).first()
+                if not matched_agreement:
+                    if agreements_qs.count() == 1:
+                        matched_agreement = agreements_qs.first()
+            else:
+                matched_agreement = agreements_qs.first()
+
+            if not matched_agreement:
+                logger.warning(
+                    "No AWAITING_PAYMENT escrow agreement found for buyer %s with amount %s",
+                    buyer.email, target_amount
+                )
+                return
+
+            # Transition the agreement to ACTIVE
+            matched_agreement.status = EscrowAgreement.Status.ACTIVE
+            matched_agreement.nomba_transaction_ref = payment_ref
+            matched_agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
+
         logger.info(
             "EscrowAgreement %s marked ACTIVE based on virtual account credit. Ref=%s",
             matched_agreement.id, payment_ref

@@ -1,5 +1,6 @@
 import logging
 
+from django.db.models import Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, permissions, status
@@ -40,9 +41,7 @@ class AgreementViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return only agreements where the authenticated user is buyer or seller."""
         user = self.request.user
-        return EscrowAgreement.objects.filter(
-            buyer=user
-        ) | EscrowAgreement.objects.filter(seller=user)
+        return EscrowAgreement.objects.filter(Q(buyer=user) | Q(seller=user))
 
     # ------------------------------------------------------------------
     # Action: draft_with_ai
@@ -186,9 +185,14 @@ class AgreementViewSet(viewsets.ModelViewSet):
                 }, status=status.HTTP_200_OK)
             except NombaInsufficientFundsError:
                 # If balance is actually insufficient on Nomba side, fall back to bank transfer flow
-                pass
+                logger.info(
+                    "Auto-funding insufficient for agreement %s — falling back to bank transfer.", pk
+                )
             except Exception as exc:
-                logger.error("Auto-funding hold_funds failed: %s", exc)
+                logger.warning(
+                    "Auto-funding hold_funds failed for agreement %s: %s — falling back to bank transfer.",
+                    pk, exc
+                )
 
         # 2. Otherwise, fall back to normal bank transfer flow
         agreement.status = EscrowAgreement.Status.AWAITING_PAYMENT
@@ -268,10 +272,13 @@ class AgreementViewSet(viewsets.ModelViewSet):
         # Refresh from DB after task update
         milestone.refresh_from_db()
 
-        # If all milestones met, advance status
+        # If all milestones met, advance status to PENDING_PROOF (signals buyer to review & release)
         if agreement.all_milestones_met():
             agreement.status = EscrowAgreement.Status.PENDING_PROOF
             agreement.save(update_fields=['status', 'updated_at'])
+        elif agreement.status == EscrowAgreement.Status.ACTIVE:
+            # At least one milestone still unmet; keep the agreement ACTIVE
+            pass
 
         return Response(
             MilestoneSerializer(milestone).data,
