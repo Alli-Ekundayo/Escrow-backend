@@ -61,9 +61,9 @@ class NombaPaymentService:
     _token_lock = threading.Lock()
 
     # Nomba MFB's own bank code, looked up from /v1/transfers/banks and cached.
-    # Fallback: "100" (3-digit code accepted by Nomba for Nomba-issued virtual accounts).
+    # Confirmed live fallback: "090645" (Nombank MFB's 6-digit code from /v1/transfers/banks).
     # The Nomba transfer API requires bankCode to be exactly 3 or 6 digits.
-    _NOMBA_BANK_CODE_FALLBACK = "100"
+    _NOMBA_BANK_CODE_FALLBACK = "090645"
     _nomba_bank_code_cache: dict = {}  # keyed by base_url
     _bank_code_lock = threading.Lock()
 
@@ -389,11 +389,10 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Pay out from the parent merchant account.
-        # All virtual-account inflows (collection.credit) are credited to the
-        # parent account by Nomba — the sub-account is a separate ledger that
-        # is not automatically funded by incoming virtual-account transfers.
-        source = self.parent_account_id
+        # Pay out from the merchant sub-account.
+        # NOTE: /v2/transfers/bank/{id} only accepts sub-account IDs.
+        # The sub-account must be funded via the Nomba dashboard before payouts work.
+        source = self.sub_account_id
 
         # Resolve the numeric bank code Nomba requires (3 or 6 digits).
         bank_code = self._resolve_bank_code(seller_bank_code)
@@ -467,7 +466,7 @@ class NombaPaymentService:
             "narration": f"TrustFlow wallet withdrawal — {ref}",
             "senderName": "TrustFlow Escrow",
         }
-        response = self._post(f"/v2/transfers/bank/{self.parent_account_id}", payload)
+        response = self._post(f"/v2/transfers/bank/{self.sub_account_id}", payload)
         return response.get("data", response)
 
     def refund_to_buyer(
@@ -492,8 +491,8 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Refund from the parent merchant account (same reason as release_to_seller).
-        source = self.parent_account_id
+        # Refund from the merchant sub-account (same constraint as release_to_seller).
+        source = self.sub_account_id
 
         # Resolve the numeric bank code Nomba requires (3 or 6 digits).
         bank_code = self._resolve_bank_code(buyer_bank_code)
