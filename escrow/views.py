@@ -164,6 +164,8 @@ class AgreementViewSet(viewsets.ModelViewSet):
             try:
                 from decimal import Decimal
                 from django.db import transaction
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
 
                 with transaction.atomic():
                     # Refresh buyer and lock to avoid race conditions
