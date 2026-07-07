@@ -158,39 +158,33 @@ class AgreementViewSet(viewsets.ModelViewSet):
         ref = f"tf-{agreement.pk}-{int(timezone.now().timestamp())}"
 
         # 1. Try to fund directly if buyer has sufficient wallet balance
-        try:
-            balance_data = NombaPaymentService().get_account_balance(buyer.nomba_account_holder_id)
-            available_balance = float(balance_data.get("amount", 0.0))
-        except Exception as exc:
-            logger.warning("Could not check wallet balance: %s", exc)
-            available_balance = 0.0
+        available_balance = float(buyer.wallet_balance)
 
         if available_balance >= float(agreement.amount):
             try:
-                NombaPaymentService().hold_funds(
-                    amount=float(agreement.amount),
-                    buyer_account_number=buyer.nomba_account_number,
-                    buyer_bank_code=buyer.nomba_bank_code,
-                    ref=ref
-                )
-                # Successful direct funding!
-                agreement.status = EscrowAgreement.Status.ACTIVE
-                agreement.nomba_transaction_ref = ref
-                agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
+                from decimal import Decimal
+                from django.db import transaction
 
-                return Response({
-                    "detail": "Agreement successfully funded from your existing wallet balance.",
-                    "status": "ACTIVE",
-                    "agreement": EscrowAgreementSerializer(agreement, context={'request': request}).data
-                }, status=status.HTTP_200_OK)
-            except NombaInsufficientFundsError:
-                # If balance is actually insufficient on Nomba side, fall back to bank transfer flow
-                logger.info(
-                    "Auto-funding insufficient for agreement %s — falling back to bank transfer.", pk
-                )
+                with transaction.atomic():
+                    # Refresh buyer and lock to avoid race conditions
+                    buyer_refreshed = User.objects.select_for_update().get(pk=buyer.pk)
+                    if buyer_refreshed.wallet_balance >= agreement.amount:
+                        buyer_refreshed.wallet_balance -= agreement.amount
+                        buyer_refreshed.save(update_fields=['wallet_balance'])
+
+                        # Successful direct funding!
+                        agreement.status = EscrowAgreement.Status.ACTIVE
+                        agreement.nomba_transaction_ref = ref
+                        agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
+
+                        return Response({
+                            "detail": "Agreement successfully funded from your existing wallet balance.",
+                            "status": "ACTIVE",
+                            "agreement": EscrowAgreementSerializer(agreement, context={'request': request}).data
+                        }, status=status.HTTP_200_OK)
             except Exception as exc:
                 logger.warning(
-                    "Auto-funding hold_funds failed for agreement %s: %s — falling back to bank transfer.",
+                    "Auto-funding from local balance failed for agreement %s: %s — falling back to bank transfer.",
                     pk, exc
                 )
 

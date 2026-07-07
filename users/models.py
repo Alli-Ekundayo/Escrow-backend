@@ -24,6 +24,9 @@ class User(AbstractUser):
     # /v2/transfers/bank/{id} to send money OUT of the virtual account (e.g. on release/refund)
     nomba_account_holder_id = models.CharField(max_length=100, blank=True)
 
+    # Local wallet ledger balance (since Nomba virtual accounts do not hold balances themselves)
+    wallet_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+
     USERNAME_FIELD = 'email'
     # username + phone required at registration
     REQUIRED_FIELDS = ['username', 'phone_number']

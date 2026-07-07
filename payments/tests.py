@@ -335,8 +335,8 @@ class WebhookPaymentConfirmationTest(TestCase):
 
         self.agreement.refresh_from_db()
         self.assertEqual(self.agreement.status, EscrowAgreement.Status.ACTIVE)
-        # Verify transaction reference is updated to the actual payment reference
-        self.assertEqual(self.agreement.nomba_transaction_ref, "payment-ref-abc-123")
+        # Verify transaction reference is preserved as the original escrow ref
+        self.assertEqual(self.agreement.nomba_transaction_ref, "tf-tx-12345")
 
     def test_webhook_invalid_signature_returns_401(self):
         """Webhook with invalid signature must return 401 Unauthorized."""

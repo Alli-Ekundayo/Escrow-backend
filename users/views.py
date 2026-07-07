@@ -107,9 +107,10 @@ class WithdrawView(APIView):
             from payments.services import NombaPaymentService
             svc = NombaPaymentService()
 
-            # Fetch and check current live available balance
-            balance_info = svc.get_account_balance(user.nomba_account_holder_id)
-            available_balance = NombaPaymentService.parse_balance(balance_info)
+            from decimal import Decimal
+            from django.db import transaction
+
+            available_balance = float(user.wallet_balance)
 
             if amount_val > available_balance:
                 return Response(
@@ -124,16 +125,28 @@ class WithdrawView(APIView):
 
             tx_ref = f"tf-wd-{user.id}-{uuid.uuid4().hex[:8]}"
 
-            result = svc.withdraw_to_bank(
-                amount=amount_val,
-                account_number=account_number,
-                bank_code=bank_code,
-                ref=tx_ref,
-            )
-            return Response(
-                {"detail": "Withdrawal successful", "data": result},
-                status=status.HTTP_200_OK
-            )
+            # Deduct locally first
+            with transaction.atomic():
+                user.wallet_balance -= Decimal(str(amount_val))
+                user.save(update_fields=['wallet_balance'])
+
+            try:
+                result = svc.withdraw_to_bank(
+                    amount=amount_val,
+                    account_number=account_number,
+                    bank_code=bank_code,
+                    ref=tx_ref,
+                )
+                return Response(
+                    {"detail": "Withdrawal successful", "data": result},
+                    status=status.HTTP_200_OK
+                )
+            except Exception as exc:
+                # Reverse deduction on failure
+                with transaction.atomic():
+                    user.wallet_balance += Decimal(str(amount_val))
+                    user.save(update_fields=['wallet_balance'])
+                raise exc
         except Exception as exc:
             logging.getLogger(__name__).error("Withdrawal error for user %s: %s", user.id, exc)
             return Response(

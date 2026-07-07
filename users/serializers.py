@@ -97,14 +97,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         ]
 
     def get_wallet_balance(self, obj) -> float:
-        if obj.nomba_account_holder_id:
-            try:
-                from payments.services import NombaPaymentService
-                balance_data = NombaPaymentService().get_account_balance(obj.nomba_account_holder_id)
-                return NombaPaymentService.parse_balance(balance_data)
-            except Exception:
-                return 0.0
-        return 0.0
+        return float(obj.wallet_balance)
 
     def get_nomba_test_mode(self, obj) -> bool:
         from django.conf import settings

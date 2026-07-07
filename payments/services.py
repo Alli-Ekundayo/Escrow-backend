@@ -710,39 +710,41 @@ class NombaPaymentService:
                     )
 
             # ── Strategy 2: buyer account + amount ──────────────────────────────
-            if not matched_agreement:
-                buyer = None
-                if account_number:
-                    buyer = User.objects.filter(nomba_account_number=account_number).first()
-                if not buyer and account_ref:
-                    buyer = User.objects.filter(nomba_account_ref=account_ref).first()
+            buyer = None
+            if account_number:
+                buyer = User.objects.select_for_update().filter(nomba_account_number=account_number).first()
+            if not buyer and account_ref:
+                buyer = User.objects.select_for_update().filter(nomba_account_ref=account_ref).first()
 
-                if buyer:
-                    agreements_qs = EscrowAgreement.objects.select_for_update().filter(
-                        buyer=buyer,
-                        status=EscrowAgreement.Status.AWAITING_PAYMENT,
-                    )
-                    if target_amount:
-                        matched_agreement = agreements_qs.filter(amount=target_amount).first()
-                    # ── Strategy 3: single-agreement fallback ────────────────────
-                    if not matched_agreement and agreements_qs.count() == 1:
-                        matched_agreement = agreements_qs.first()
-                        logger.info(
-                            "Single-agreement fallback for buyer %s (amount=%s)",
-                            buyer.email, target_amount
-                        )
-                else:
-                    logger.error(
-                        "No user found with account %s or ref %s",
-                        account_number, account_ref
-                    )
-
-            if not matched_agreement:
-                logger.warning(
-                    "No AWAITING_PAYMENT escrow agreement found for "
-                    "merchantTxRef=%s, amount=%s",
-                    merchant_tx_ref, target_amount
+            if not matched_agreement and buyer:
+                agreements_qs = EscrowAgreement.objects.select_for_update().filter(
+                    buyer=buyer,
+                    status=EscrowAgreement.Status.AWAITING_PAYMENT,
                 )
+                if target_amount:
+                    matched_agreement = agreements_qs.filter(amount=target_amount).first()
+                # ── Strategy 3: single-agreement fallback ────────────────────
+                if not matched_agreement and agreements_qs.count() == 1:
+                    matched_agreement = agreements_qs.first()
+                    logger.info(
+                        "Single-agreement fallback for buyer %s (amount=%s)",
+                        buyer.email, target_amount
+                    )
+
+            if not matched_agreement:
+                if buyer and target_amount:
+                    buyer.wallet_balance += target_amount
+                    buyer.save(update_fields=['wallet_balance'])
+                    logger.info(
+                        "Direct wallet funding: credited user %s with NGN %s. New balance: %s",
+                        buyer.email, target_amount, buyer.wallet_balance
+                    )
+                else:
+                    logger.warning(
+                        "No AWAITING_PAYMENT escrow agreement found and no buyer found to credit for "
+                        "merchantTxRef=%s, amount=%s",
+                        merchant_tx_ref, target_amount
+                    )
                 return
 
             # ── Activate the agreement ───────────────────────────────────────────
