@@ -60,6 +60,13 @@ class NombaPaymentService:
     _token_cache: dict = {}
     _token_lock = threading.Lock()
 
+    # Nomba MFB's own bank code, looked up from /v1/transfers/banks and cached.
+    # Fallback: "100" (3-digit code accepted by Nomba for Nomba-issued virtual accounts).
+    # The Nomba transfer API requires bankCode to be exactly 3 or 6 digits.
+    _NOMBA_BANK_CODE_FALLBACK = "100"
+    _nomba_bank_code_cache: dict = {}  # keyed by base_url
+    _bank_code_lock = threading.Lock()
+
     # -----------------------------------------------------------------------
     # Initialisation
     # -----------------------------------------------------------------------
@@ -310,6 +317,53 @@ class NombaPaymentService:
         response = self._post(f"/v2/transfers/bank/{self.sub_account_id}", payload)
         return response.get("data", response)
 
+    def _resolve_bank_code(self, raw_code: str) -> str:
+        """
+        Translates the internal storage code (e.g. "NMB") to a numeric bank code
+        that the Nomba transfer API accepts (must be exactly 3 or 6 digits).
+
+        For Nomba-issued virtual accounts (bank_code stored as "NMB"), we look up
+        the real Nomba MFB code from /v1/transfers/banks and cache it for the
+        lifetime of the process. Falls back to "100" (Nomba MFB's sort code)
+        if the API call fails or Nomba MFB is not found in the list.
+
+        Non-NMB codes are returned as-is (already numeric from the bank list).
+        """
+        if raw_code not in ("NMB", ""):
+            return raw_code
+
+        with self._bank_code_lock:
+            cached = self._nomba_bank_code_cache.get(self.base_url)
+            if cached:
+                return cached
+
+            try:
+                resp = requests.get(
+                    f"{self.base_url}/v1/transfers/banks",
+                    headers=self._auth_headers(),
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                banks = resp.json().get("data", [])
+                for bank in banks:
+                    name = (bank.get("bankName") or bank.get("name") or "").lower()
+                    if "nomba" in name or "nombank" in name:
+                        code = bank.get("bankCode") or bank.get("code", "")
+                        # Nomba requires exactly 3 or 6 digit numeric codes
+                        if code and len(code) in (3, 6) and code.isdigit():
+                            logger.info("Resolved Nomba MFB bank code: %s (%s)", code, name)
+                            self._nomba_bank_code_cache[self.base_url] = code
+                            return code
+            except Exception as exc:
+                logger.warning(
+                    "Could not resolve Nomba MFB bank code from API — using fallback %s: %s",
+                    self._NOMBA_BANK_CODE_FALLBACK, exc
+                )
+
+            # Fallback: Nomba MFB's sort code (3 digits, always accepted by Nomba transfer API)
+            self._nomba_bank_code_cache[self.base_url] = self._NOMBA_BANK_CODE_FALLBACK
+            return self._NOMBA_BANK_CODE_FALLBACK
+
     def release_to_seller(
         self,
         amount: float,
@@ -324,20 +378,21 @@ class NombaPaymentService:
         Args:
             amount:                Amount in NGN.
             seller_account_number: Seller's bank account number.
-            seller_bank_code:      Seller's bank code.
+            seller_bank_code:      Seller's bank code ("NMB" is resolved to the real
+                                   numeric Nomba MFB code via /v1/transfers/banks).
             ref:                   Original escrow agreement reference.
-            source_account_id:     Source account UUID (e.g. buyer's accountHolderId).
-                                   Defaults to sub_account_id.
+            source_account_id:     Unused (payout always comes from the merchant
+                                   sub-account; kept for API compatibility).
 
         Returns:
             Nomba transfer response data dict.
         """
-        # Outbound payouts must be sent from the merchant's sub-account ID.
-        # Customer virtual account holder IDs are not valid source accounts.
+        # Always pay out from the merchant sub-account — never from a customer
+        # virtual account holder ID.
         source = self.sub_account_id
-        bank_code = seller_bank_code
-        if bank_code == "NMB":
-            bank_code = "101"
+
+        # Resolve the numeric bank code Nomba requires (3 or 6 digits).
+        bank_code = self._resolve_bank_code(seller_bank_code)
 
         account_name = "TrustFlow Recipient"
         try:
@@ -350,8 +405,7 @@ class NombaPaymentService:
             if resolved_name:
                 account_name = resolved_name
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Nomba account lookup failed: %s", exc)
+            logger.warning("Nomba account lookup failed during payout: %s", exc)
 
         payload = {
             "amount": int(round(float(amount) * 100)),
@@ -362,6 +416,10 @@ class NombaPaymentService:
             "narration": f"TrustFlow payout — {ref}",
             "senderName": "TrustFlow Escrow",
         }
+        logger.info(
+            "Initiating payout: amount=%.2f NGN, to=%s (bank_code=%s), ref=%s-release",
+            amount, seller_account_number, bank_code, ref
+        )
         response = self._post(f"/v2/transfers/bank/{source}", payload)
         return response.get("data", response)
 
@@ -429,12 +487,11 @@ class NombaPaymentService:
         Returns:
             Nomba transfer response data dict.
         """
-        # Outbound refunds must be sent from the merchant's sub-account ID.
-        # Customer virtual account holder IDs are not valid source accounts.
+        # Always refund from the merchant sub-account.
         source = self.sub_account_id
-        bank_code = buyer_bank_code
-        if bank_code == "NMB":
-            bank_code = "101"
+
+        # Resolve the numeric bank code Nomba requires (3 or 6 digits).
+        bank_code = self._resolve_bank_code(buyer_bank_code)
 
         account_name = "TrustFlow Recipient"
         try:
@@ -458,6 +515,10 @@ class NombaPaymentService:
             "narration": f"TrustFlow refund — {ref}",
             "senderName": "TrustFlow Escrow",
         }
+        logger.info(
+            "Initiating refund: amount=%.2f NGN, to=%s (bank_code=%s), ref=%s-refund",
+            amount, buyer_account_number, bank_code, ref
+        )
         response = self._post(f"/v2/transfers/bank/{source}", payload)
         return response.get("data", response)
 
@@ -547,6 +608,13 @@ class NombaPaymentService:
                     "Fund the virtual account via the Nomba dashboard or API before retrying."
                 ) from exc
 
+        # 422 means the request body is semantically invalid (e.g. wrong bank code format).
+        # Surface it as NombaAPIError with a descriptive message.
+        if status_code == 422:
+            raise NombaAPIError(
+                f"Nomba rejected the request (HTTP 422 — Unprocessable Entity): {body}"
+            ) from exc
+
         raise NombaAPIError(
             f"Nomba API error (HTTP {status_code}): {body}"
         ) from exc
@@ -579,8 +647,12 @@ class NombaPaymentService:
     def _on_collection_credit(self, data: dict) -> None:
         """
         Hook: Handles incoming funds into a buyer's virtual account.
-        Finds the user matching the account number or reference,
-        finds their EscrowAgreement in AWAITING_PAYMENT, and transitions to ACTIVE.
+        Finds the EscrowAgreement in AWAITING_PAYMENT and transitions it to ACTIVE.
+
+        Matching strategy (in priority order):
+          1. merchantTxRef → nomba_transaction_ref (set during lock_funds — most reliable).
+          2. Buyer account number/ref + exact amount match (kobo→naira converted).
+          3. Single-agreement fallback (if buyer has only one pending agreement).
 
         Uses select_for_update() inside an atomic block to prevent a race
         condition where two concurrent webhook retries activate the same agreement.
@@ -592,67 +664,98 @@ class NombaPaymentService:
         User = get_user_model()
 
         account_number = data.get("bankAccountNumber") or data.get("accountNumber")
-        account_ref = data.get("accountRef")
-        amount = data.get("amount") or data.get("amountReceived")
-        payment_ref = data.get("paymentRef") or data.get("reference") or data.get("merchantTxRef", "")
+        account_ref    = data.get("accountRef")
+        amount         = data.get("amount") or data.get("amountReceived")
+        # merchantTxRef is the escrow reference set during lock_funds (tf-{pk}-{timestamp}).
+        # It is the canonical key for finding the agreement.
+        merchant_tx_ref = data.get("merchantTxRef", "")
+        # paymentRef / reference is the payment provider's own transaction ID — we log it
+        # but do NOT use it to overwrite the stored escrow reference.
+        payment_ref = data.get("paymentRef") or data.get("reference") or merchant_tx_ref
 
         logger.info(
-            "Collection credit received: account=%s, ref=%s, amount=%s, payment_ref=%s",
-            account_number, account_ref, amount, payment_ref
+            "Collection credit received: account=%s, account_ref=%s, amount=%s, "
+            "merchant_tx_ref=%s, payment_ref=%s",
+            account_number, account_ref, amount, merchant_tx_ref, payment_ref
         )
 
-        if not account_number and not account_ref:
-            logger.error("Missing account number and account ref in webhook data.")
+        if not account_number and not account_ref and not merchant_tx_ref:
+            logger.error("Missing account number, account ref, and merchantTxRef in webhook data.")
             return
 
-        # Find the buyer user
-        buyer = None
-        if account_number:
-            buyer = User.objects.filter(nomba_account_number=account_number).first()
-        if not buyer and account_ref:
-            buyer = User.objects.filter(nomba_account_ref=account_ref).first()
-
-        if not buyer:
-            logger.error("No user found with Nomba account %s or ref %s", account_number, account_ref)
-            return
-
+        # Convert incoming amount (Nomba sends in kobo) to Naira for DB matching.
         try:
-            # Convert incoming Kobo to Naira Decimal
-            target_amount = Decimal(str(amount)) / 100
+            target_amount = Decimal(str(amount)) / 100 if amount is not None else None
         except (TypeError, ValueError):
             logger.error("Invalid amount in webhook data: %s", amount)
-            return
+            target_amount = None
 
         # Use an atomic block + select_for_update to prevent two concurrent webhook
         # retries from activating the same agreement simultaneously.
         with transaction.atomic():
-            agreements_qs = EscrowAgreement.objects.select_for_update().filter(
-                buyer=buyer,
-                status=EscrowAgreement.Status.AWAITING_PAYMENT,
-            )
-
             matched_agreement = None
-            if target_amount:
-                matched_agreement = agreements_qs.filter(amount=target_amount).first()
-                if not matched_agreement:
-                    if agreements_qs.count() == 1:
+
+            # ── Strategy 1: match by merchantTxRef ──────────────────────────────
+            # This is the most reliable path: the frontend sends the agreement's stored
+            # nomba_transaction_ref back as merchantTxRef when simulating / paying.
+            if merchant_tx_ref:
+                matched_agreement = EscrowAgreement.objects.select_for_update().filter(
+                    nomba_transaction_ref=merchant_tx_ref,
+                    status=EscrowAgreement.Status.AWAITING_PAYMENT,
+                ).first()
+                if matched_agreement:
+                    logger.info(
+                        "Agreement %s matched by merchantTxRef=%s",
+                        matched_agreement.id, merchant_tx_ref
+                    )
+
+            # ── Strategy 2: buyer account + amount ──────────────────────────────
+            if not matched_agreement:
+                buyer = None
+                if account_number:
+                    buyer = User.objects.filter(nomba_account_number=account_number).first()
+                if not buyer and account_ref:
+                    buyer = User.objects.filter(nomba_account_ref=account_ref).first()
+
+                if buyer:
+                    agreements_qs = EscrowAgreement.objects.select_for_update().filter(
+                        buyer=buyer,
+                        status=EscrowAgreement.Status.AWAITING_PAYMENT,
+                    )
+                    if target_amount:
+                        matched_agreement = agreements_qs.filter(amount=target_amount).first()
+                    # ── Strategy 3: single-agreement fallback ────────────────────
+                    if not matched_agreement and agreements_qs.count() == 1:
                         matched_agreement = agreements_qs.first()
-            else:
-                matched_agreement = agreements_qs.first()
+                        logger.info(
+                            "Single-agreement fallback for buyer %s (amount=%s)",
+                            buyer.email, target_amount
+                        )
+                else:
+                    logger.error(
+                        "No user found with account %s or ref %s",
+                        account_number, account_ref
+                    )
 
             if not matched_agreement:
                 logger.warning(
-                    "No AWAITING_PAYMENT escrow agreement found for buyer %s with amount %s",
-                    buyer.email, target_amount
+                    "No AWAITING_PAYMENT escrow agreement found for "
+                    "merchantTxRef=%s, amount=%s",
+                    merchant_tx_ref, target_amount
                 )
                 return
 
-            # Transition the agreement to ACTIVE
+            # ── Activate the agreement ───────────────────────────────────────────
+            # Do NOT overwrite nomba_transaction_ref — it already holds the canonical
+            # escrow ref (tf-{pk}-{timestamp}) set during lock_funds.  Overwriting it
+            # with the incoming payment_ref would break release/refund lookups.
             matched_agreement.status = EscrowAgreement.Status.ACTIVE
-            matched_agreement.nomba_transaction_ref = payment_ref
-            matched_agreement.save(update_fields=['status', 'nomba_transaction_ref', 'updated_at'])
+            matched_agreement.save(update_fields=['status', 'updated_at'])
 
         logger.info(
-            "EscrowAgreement %s marked ACTIVE based on virtual account credit. Ref=%s",
-            matched_agreement.id, payment_ref
+            "EscrowAgreement %s marked ACTIVE via collection credit. "
+            "Stored ref=%s, incoming merchant_tx_ref=%s",
+            matched_agreement.id,
+            matched_agreement.nomba_transaction_ref,
+            merchant_tx_ref,
         )
