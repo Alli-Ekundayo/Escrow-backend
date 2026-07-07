@@ -1,6 +1,51 @@
 # Escrow-Backend
 
-A comprehensive escrow system built with Django for the TrustFlow platform.
+A comprehensive escrow system built with Django for the **TrustFlow** platform — AI-powered, Nomba-integrated peer-to-peer escrow for the Nigerian market.
+
+---
+
+## 🔐 Reviewer Access (Start Here)
+
+> **Skip signup entirely.** Use the accounts below to explore the full escrow lifecycle immediately.
+
+### 🌐 Live Application
+
+| Service | URL |
+|---|---|
+| **Frontend App** | https://escrow-frontend-618z.vercel.app |
+| **Backend API** | https://escrow-backend-production-7b3d.up.railway.app/api/v1 |
+| **API Admin Panel** | https://escrow-backend-production-7b3d.up.railway.app/admin |
+
+---
+
+### 👤 Demo Accounts
+
+#### Buyer (funds the escrow)
+| Field | Value |
+|---|---|
+| **Email** | `onepeice@gmail.com` |
+| **Password** | `TrustFlow2026!` |
+
+#### Seller (receives the payout)
+| Field | Value |
+|---|---|
+| **Email** | `ada@yahoo.com` |
+| **Password** | `TrustFlow2026!` |
+
+---
+
+### 🚦 Suggested Review Flow
+
+1. Open **https://escrow-frontend-618z.vercel.app**.
+2. Log in as the **Buyer** (`onepeice@gmail.com` / `TrustFlow2026!`).
+3. Create a new escrow agreement — paste any service description and let AI draft the conditions.
+4. Fund the escrow.
+5. Log out, then log in as the **Seller** (`ada@yahoo.com` / `TrustFlow2026!`).
+6. Mark milestones complete; the buyer can then release funds.
+7. Observe the payout arriving in the seller's account.
+
+---
+
 
 ## 🛠️ Tech Stack
 - **Backend**: Django, Django Rest Framework
