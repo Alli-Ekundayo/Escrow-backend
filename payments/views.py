@@ -30,6 +30,10 @@ class NombaWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        # Read raw body FIRST before DRF's lazy JSON parser can consume it.
+        # Accessing request.body after request.data has been parsed raises an error.
+        raw_body = request.body
+
         # Webhook signature verification
         webhook_secret = getattr(settings, "NOMBA_WEBHOOK_SECRET", "")
         is_test_mode = getattr(settings, "NOMBA_TEST_MODE", True)
@@ -48,7 +52,13 @@ class NombaWebhookView(APIView):
                 "Bypassing signature verification (TEST_MODE only)."
             )
         else:
-            signature = request.headers.get("nomba-signature")
+            # Nomba sends the signature in 'nomba-signature'.
+            # It may also appear in 'nomba-sig-value' as a fallback.
+            # The value may carry a 'sha256=' or 'hmacsha256=' prefix — strip it.
+            signature = (
+                request.headers.get("nomba-signature")
+                or request.headers.get("nomba-sig-value")
+            )
             if not signature:
                 if is_test_mode:
                     logger.warning("Webhook signature missing. Bypassing check because NOMBA_TEST_MODE is active.")
@@ -56,14 +66,30 @@ class NombaWebhookView(APIView):
                     logger.error("Webhook signature header 'nomba-signature' missing.")
                     return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
             else:
+                # Strip any algorithm prefix Nomba may prepend (e.g. "sha256=", "hmacsha256=")
+                sig_value = signature
+                for prefix in ("sha256=", "hmacsha256=", "hmac-sha256="):
+                    if sig_value.lower().startswith(prefix):
+                        sig_value = sig_value[len(prefix):]
+                        break
+
                 computed = hmac.new(
                     webhook_secret.encode("utf-8"),
-                    request.body,
+                    raw_body,
                     hashlib.sha256
                 ).hexdigest()
 
-                if not hmac.compare_digest(signature, computed):
-                    logger.error("Webhook signature verification failed.")
+                logger.debug(
+                    "Webhook HMAC check: received_sig=%s computed=%s",
+                    sig_value[:16] + "...", computed[:16] + "..."
+                )
+
+                if not hmac.compare_digest(sig_value, computed):
+                    logger.error(
+                        "Webhook signature verification failed. "
+                        "received=%s computed=%s (first 16 chars)",
+                        sig_value[:16], computed[:16]
+                    )
                     return Response({"detail": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED)
 
         try:
