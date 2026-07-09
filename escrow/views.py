@@ -371,23 +371,29 @@ class AgreementViewSet(viewsets.ModelViewSet):
             from django.utils import timezone as tz
 
             # Query recent transactions on the buyer's virtual account
-            since = (tz.now() - datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            since = (tz.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
             tx_resp = svc._get(
-                f"/v1/accounts/transactions",
+                "/v1/transactions/virtual",
                 params={
-                    "accountRef": buyer.nomba_account_ref,
-                    "startDate": since,
-                    "type": "CREDIT",
+                    "virtual_account": buyer.nomba_account_number,
+                    "dateFrom": since,
                 },
             )
-            transactions = tx_resp.get("data", {}).get("records", tx_resp.get("data", []))
+            transactions = tx_resp.get("data", {}).get("results", [])
 
-            expected_kobo = int(round(float(agreement.amount) * 100))
+            expected_amount = float(agreement.amount)
             matched_tx = None
             for tx in (transactions if isinstance(transactions, list) else []):
-                tx_amount = tx.get("amount") or tx.get("amountReceived", 0)
-                # Allow ±1 kobo tolerance for floating point
-                if abs(int(tx_amount) - expected_kobo) <= 1:
+                try:
+                    tx_amount = float(tx.get("amount") or 0)
+                except (ValueError, TypeError):
+                    continue
+                # Allow ±0.01 Naira tolerance, entryType must be CREDIT, status must be SUCCESS
+                if (
+                    abs(tx_amount - expected_amount) <= 0.01
+                    and tx.get("entryType") == "CREDIT"
+                    and tx.get("status") == "SUCCESS"
+                ):
                     matched_tx = tx
                     break
 
@@ -400,8 +406,10 @@ class AgreementViewSet(viewsets.ModelViewSet):
                     agr.save(update_fields=["status", "updated_at"])
                 logger.info(
                     "verify_payment: Agreement %s activated via Nomba transaction history. "
-                    "tx_ref=%s, amount=%s kobo",
-                    agreement.id, matched_tx.get("reference"), matched_tx.get("amount")
+                    "tx_ref=%s, amount=%s",
+                    agreement.id,
+                    matched_tx.get("id") or matched_tx.get("billingVendorReference"),
+                    matched_tx.get("amount"),
                 )
                 agreement.refresh_from_db()
                 return Response(
